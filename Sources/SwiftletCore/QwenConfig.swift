@@ -66,6 +66,7 @@ public struct QwenConfig: Sendable {
         }
 
         modelType = (text["model_type"] as? String) ?? (top["model_type"] as? String) ?? "qwen3_next"
+        let isQwen35Family = modelType.hasPrefix("qwen3_5") || modelType.hasPrefix("qwen3_6") || isNested
         hiddenSize = try int("hidden_size")
         numHiddenLayers = try int("num_hidden_layers")
         numAttentionHeads = try int("num_attention_heads")
@@ -97,9 +98,13 @@ public struct QwenConfig: Sendable {
         numExpertsPerTok = try int("num_experts_per_tok")
         moeIntermediateSize = try int("moe_intermediate_size")
         sharedExpertIntermediateSize = try int("shared_expert_intermediate_size")
-        normTopkProb = (text["norm_topk_prob"] as? Bool) ?? false
+        // Absent-key default is FAMILY-SPECIFIC in mlx-lm: qwen3_5's
+        // TextModelArgs defaults to true, qwen3_next's ModelArgs to false.
+        // Qwen3.5/3.6 checkpoints omit the key and rely on that default;
+        // missing the renormalization scales every MoE output by the raw
+        // top-k softmax mass (~0.2-0.6) and wrecks generation.
+        normTopkProb = (text["norm_topk_prob"] as? Bool) ?? isQwen35Family
 
-        let isQwen35Family = modelType.hasPrefix("qwen3_5") || modelType.hasPrefix("qwen3_6") || isNested
         deltaLayout = isQwen35Family ? .split : .fusedInterleaved
         weightPrefix = isNested ? "language_model." : ""
     }

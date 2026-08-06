@@ -21,7 +21,6 @@
     "vocab_size": 128,
     "max_position_embeddings": 512,
     "full_attention_interval": 4,
-    "norm_topk_prob": true,
     "tie_word_embeddings": false,
     "rope_parameters": {
       "rope_theta": 10000000.0,

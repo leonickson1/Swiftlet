@@ -48,7 +48,17 @@ ARGS = dict(
     full_attention_interval=4,
 )
 
-TOKENS = [1, 5, 9, 42, 7, 99, 3, 17, 64, 2]
+# >= 50 tokens: long enough for position-dependent bugs (RoPE drift, conv
+# tail, delta-state decay) to surface — 10-token fixtures let the qwen3_5
+# norm_topk_prob default bug through unseen.
+TOKENS = [
+    1, 5, 9, 42, 7, 99, 3, 17, 64, 2,
+    23, 88, 101, 54, 12, 71, 33, 90, 6, 47,
+    120, 15, 78, 29, 4, 61, 110, 8, 36, 95,
+    50, 27, 83, 14, 68, 41, 126, 19, 73, 32,
+    58, 11, 104, 45, 21, 87, 66, 30, 116, 53,
+    25, 92, 38, 79, 16, 107,
+]
 
 
 def main() -> None:
@@ -164,7 +174,9 @@ def gen_qwen3_5_fixtures() -> None:
         vocab_size=128,
         max_position_embeddings=512,
         full_attention_interval=4,
-        norm_topk_prob=True,
+        # norm_topk_prob deliberately OMITTED: real Qwen3.5/3.6 checkpoints
+        # don't carry the key and rely on TextModelArgs' family default
+        # (True). The Swift config parser must reproduce that default.
         tie_word_embeddings=False,
         rope_parameters={
             "rope_type": "default",
