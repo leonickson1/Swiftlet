@@ -47,6 +47,26 @@ func runVerify(modelDir: String, fixturesPath: String) throws {
         guard fixtures.tensors[name] != nil else { continue }
         try report(name, caps.layerOutputs[i])
     }
+
+    // Layer-LOCAL check: run each layer from the REFERENCE input so upstream
+    // drift can't pile up — this is what localizes a divergence to one layer.
+    print("  --- layer-local (input from fixture) ---")
+    for i in 0..<model.config.numHiddenLayers {
+        let inName = i == 0 ? "embed" : String(format: "layer_%02d", i - 1)
+        let outName = String(format: "layer_%02d", i)
+        guard fixtures.tensors[inName] != nil, fixtures.tensors[outName] != nil else { continue }
+        let refIn = try fixtures.floats(inName)
+        let localOut = try model.layerForward(refIn, S: tokens.count, layerIndex: i)
+        let refOut = try fixtures.floats(outName)
+        var maxDiff: Float = 0
+        var maxPos = 0
+        for j in 0..<min(localOut.count, refOut.count) {
+            let d = abs(localOut[j] - refOut[j])
+            if d > maxDiff { maxDiff = d; maxPos = j / model.config.hiddenSize }
+        }
+        let kind = model.config.isLinearLayer(i) ? "delta" : "attn "
+        print(String(format: "  local layer_%02d [%@] maxAbsDiff %.3e (worst at pos %d)", i, kind as NSString, maxDiff, maxPos))
+    }
     try report("final_norm", caps.finalNorm)
     if fixtures.tensors["logits"] != nil {
         try report("logits", caps.logits)
@@ -189,6 +209,30 @@ case "info" where args.count >= 3:
 case "verify" where args.count >= 4:
     do { try runVerify(modelDir: args[2], fixturesPath: args[3]) } catch {
         print("verify failed: \(error)")
+        exit(1)
+    }
+case "dump-tensor" where args.count >= 5:
+    // Debug: write the dequantized f32 weights of a module to a safetensors
+    // file (swiftlet dump-tensor <model-dir> <module-path> <out.safetensors>).
+    do {
+        let ckpt = try Checkpoint(dir: URL(fileURLWithPath: args[2]))
+        let path = args[3]
+        let w = try ckpt.moduleWeight(path)
+        let shape = try ckpt.shape(path + (ckpt.isQuantized(path) ? ".scales" : ".weight"))
+        var logicalShape = shape
+        if ckpt.isQuantized(path) {
+            // scales shape = (rows..., groups); recover logical cols from count.
+            let rows = shape.dropLast().reduce(1, *)
+            logicalShape = Array(shape.dropLast()) + [w.count / rows]
+        }
+        let data = w.withUnsafeBufferPointer { Data(buffer: $0) }
+        try SafetensorsFile.write(
+            to: URL(fileURLWithPath: args[4]),
+            tensors: [(name: path, dtype: "F32", shape: logicalShape, bytes: data)]
+        )
+        print("wrote \(path) shape \(logicalShape) (\(w.count) floats)")
+    } catch {
+        print("dump failed: \(error)")
         exit(1)
     }
 case "generate" where args.count >= 3:
