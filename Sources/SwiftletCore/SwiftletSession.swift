@@ -320,17 +320,26 @@ public final class SwiftletSession: @unchecked Sendable {
                         generatedCounts[best, default: 0] += 1
                         let text = self.tokenizer.decode(tokens: generated)
                         var terminated = false
-                        if text.hasPrefix(printed) {
-                            let delta = String(text.dropFirst(printed.count))
-                            if !delta.isEmpty {
-                                if case .terminated = continuation.yield(delta) { terminated = true }
-                                printed = text
-                            }
+                        // Streaming-safe delta: an emoji split across tokens
+                        // decodes with a trailing U+FFFD that must be held
+                        // back — printing it desyncs the prefix comparison
+                        // and silences the rest of the turn.
+                        if let (delta, newPrinted) = StreamingText.delta(printed: printed, decoded: text) {
+                            if case .terminated = continuation.yield(delta) { terminated = true }
+                            printed = newPrinted
                         }
                         let t0 = Date()
                         logits = try self.model.step([best], state: self.convState)
                         decodeSeconds += -t0.timeIntervalSinceNow
                         if terminated { cleanEnd = true; stopReason = "consumer-cancelled"; break }
+                    }
+                    // Flush whatever the hold-back logic still owes (a
+                    // character completed by the last token, or a genuinely
+                    // unfinishable U+FFFD when EOS cut an emoji short).
+                    if let rest = StreamingText.finalDelta(
+                        printed: printed, decoded: self.tokenizer.decode(tokens: generated)
+                    ) {
+                        continuation.yield(rest)
                     }
                     print("[SwiftletSession] stop: \(stopReason) after \(generated.count) tokens")
                     if !cleanEnd {

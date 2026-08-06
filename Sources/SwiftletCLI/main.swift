@@ -120,12 +120,13 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
         if eos.contains(best) { break }
         generated.append(best)
         if let tokenizer {
-            // Reprint only the stable delta so multi-byte tokens render correctly.
+            // Reprint only the stable delta so multi-byte tokens render
+            // correctly; StreamingText holds back incomplete characters.
             let text = tokenizer.decode(tokens: generated)
-            if text.hasPrefix(printed) {
-                print(String(text.dropFirst(printed.count)), terminator: "")
+            if let (delta, newPrinted) = StreamingText.delta(printed: printed, decoded: text) {
+                print(delta, terminator: "")
                 fflush(stdout)
-                printed = text
+                printed = newPrinted
             }
         } else {
             print(best, terminator: " ")
@@ -134,6 +135,10 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
         logits = try model.step([best], state: state)
     }
     let decodeSecs = -decodeStart.timeIntervalSinceNow
+    if let tokenizer,
+       let rest = StreamingText.finalDelta(printed: printed, decoded: tokenizer.decode(tokens: generated)) {
+        print(rest, terminator: "")
+    }
     print("")
     FileHandle.standardError.write(Data(String(
         format: "decode: %d tokens in %.1fs (%.2f tok/s)\n",
