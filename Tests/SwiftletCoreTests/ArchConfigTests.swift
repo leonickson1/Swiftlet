@@ -31,4 +31,38 @@ import Testing
         #expect(ArchConfig.qwen3_5_397B.linearLayerCount == 45)
         #expect(ArchConfig.qwen3_6_35B.routedExpertTotal == 40 * 256)
     }
+
+    /// qwen3_5_moe family pendant to qwen3Next80BLayout: constants verified
+    /// against mlx-community/Qwen3.6-35B-A3B-4bit's config.json.
+    @Test func qwen3_6_35BLayout() {
+        let c = ArchConfig.qwen3_6_35B
+        #expect(c.family == .qwen3_5Moe)
+        #expect(c.linearLayerCount == 30)
+        #expect(c.fullAttentionLayerCount == 10)
+        // layer_types list in the config: every 4th layer is full attention,
+        // which the interval-4 rule reproduces exactly (0-based 3, 7, ..., 39).
+        #expect(!c.isLinearLayer(3) && !c.isLinearLayer(39))
+        #expect(c.isLinearLayer(0) && c.isLinearLayer(38))
+        #expect(c.vocabSize == 248_320)
+        // Same expert geometry as the 80B: 2048 x 512 x3, ~1.69 MiB int4 g64.
+        #expect(c.expertBlobBytesInt4G64 == 1_769_472)
+        // top-8 of 256 experts, norm_topk_prob renormalization required.
+        #expect(c.expertTopK == 8 && c.expertCount == 256)
+        #expect(c.normTopKProb)
+    }
+
+    @Test func qwen3_5_397BLayout() {
+        let c = ArchConfig.qwen3_5_397B
+        #expect(c.family == .qwen3_5Moe)
+        #expect(c.linearLayerCount == 45 && c.fullAttentionLayerCount == 15)
+        // 3 x 4096 x 1024 params -> 6.75 MiB per expert at int4 g64.
+        #expect(c.expertParamCount == 3 * 4096 * 1024)
+        #expect(c.expertBlobBytesInt4G64 == 7_077_888)
+        // ~202.5 GiB routed-expert pool (container ~207 GiB with the dense
+        // part), ~3.96 GiB fetched per token.
+        let poolGiB = Double(c.expertBlobBytesInt4G64 * c.routedExpertTotal) / Double(1 << 30)
+        #expect(poolGiB > 200 && poolGiB < 210)
+        let perTokenGiB = Double(c.expertBlobBytesInt4G64 * c.routedFetchesPerToken) / Double(1 << 30)
+        #expect(perTokenGiB > 3.8 && perTokenGiB < 4.1)
+    }
 }
