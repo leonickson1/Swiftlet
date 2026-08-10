@@ -18,7 +18,7 @@ TurboFieldfare took 103 logged experiments because its author had no answer key.
    in C++, including CPU gated-delta-net kernels we can crib the recurrence from.
 3. **TurboFieldfare + colibri are the streaming answer key.** TF's container format, streaming
    installer, pread expert cache, and phase-overlap decode loop are model-agnostic and copyable
-   almost verbatim (file list in section 7). Colibri documents which cache/IO/quant policies
+   almost verbatim (file list in section 7). colibri documents which cache/IO/quant policies
    survived adversarial benchmarking, including the dead ends (section 8).
 4. **Pre-quantized MLX 4-bit checkpoints already exist** for all three target models
    (lmstudio-community / mlx-community). TF's quant format IS MLX affine 4-bit group-64,
