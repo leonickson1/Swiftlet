@@ -5,8 +5,9 @@ import Tokenizers
 func gib(_ bytes: Int) -> String { String(format: "%.2f GiB", Double(bytes) / Double(1 << 30)) }
 func mib(_ bytes: Int) -> String { String(format: "%.1f MiB", Double(bytes) / Double(1 << 20)) }
 
-/// S3a decode totals only. They establish an aggregate baseline, not phase or
-/// command-buffer timeline diagnosis.
+/// S3a whole-run totals plus S3b phase/timeline folds. Encode-side cost is
+/// exact per phase; wait/GPU cost is only available per command-buffer label
+/// because one buffer can span several phases.
 private struct MetalStepAggregate {
     var steps = 0
     var commandBuffersCommitted = 0
@@ -17,6 +18,15 @@ private struct MetalStepAggregate {
     var gpuExecutionSeconds = 0.0
     var gpuTimedCommandBuffers = 0
     var gpuUntimedCommandBuffers = 0
+    var phaseDispatches: [QwenMetalModel.StepPhase: Int] = [:]
+    var phaseEncodeSeconds: [QwenMetalModel.StepPhase: Double] = [:]
+    /// Per-phase GPU seconds; non-nil only when the device measured them
+    /// (dispatch-boundary counters — see QwenMetalModel.PhaseGpuSplitSupport).
+    var phaseGpuSeconds: [QwenMetalModel.StepPhase: Double]?
+    var bufferCounts: [String: Int] = [:]
+    var bufferWaitSeconds: [String: Double] = [:]
+    var bufferGpuSeconds: [String: Double] = [:]
+    var bufferGpuTimed: [String: Int] = [:]
 
     mutating func add(_ metrics: QwenMetalModel.StepMetrics) {
         steps += 1
@@ -28,7 +38,61 @@ private struct MetalStepAggregate {
         gpuExecutionSeconds += metrics.gpuExecutionSeconds
         gpuTimedCommandBuffers += metrics.gpuTimedCommandBuffers
         gpuUntimedCommandBuffers += metrics.gpuUntimedCommandBuffers
+        for (phase, n) in metrics.phaseDispatchesEncoded {
+            phaseDispatches[phase, default: 0] += n
+        }
+        for (phase, s) in metrics.phaseEncodeSeconds {
+            phaseEncodeSeconds[phase, default: 0] += s
+        }
+        if let measured = metrics.phaseGpuSeconds {
+            var merged = phaseGpuSeconds ?? [:]
+            for (phase, s) in measured { merged[phase, default: 0] += s }
+            phaseGpuSeconds = merged
+        }
+        for sample in metrics.commandBufferTimeline {
+            let label = sample.phases.map(\.rawValue).joined(separator: "+")
+            bufferCounts[label, default: 0] += 1
+            bufferWaitSeconds[label, default: 0] += sample.waitSeconds
+            if let gpu = sample.gpuSeconds {
+                bufferGpuSeconds[label, default: 0] += gpu
+                bufferGpuTimed[label, default: 0] += 1
+            }
+        }
     }
+}
+
+/// S3b stderr lines: exact encode-side phase split, then wait/GPU folded by
+/// command-buffer label (the honest granularity for those two costs).
+private func phaseSummaryLines(_ prefix: String, _ agg: MetalStepAggregate) -> [String] {
+    var lines: [String] = []
+    let phases = QwenMetalModel.StepPhase.allCases.filter {
+        agg.phaseDispatches[$0, default: 0] > 0 || agg.phaseEncodeSeconds[$0, default: 0] > 0
+    }
+    if !phases.isEmpty {
+        let cells = phases.map { phase -> String in
+            var cell = "\(phase.rawValue) enc="
+                + String(format: "%.3fs", agg.phaseEncodeSeconds[phase, default: 0])
+                + " disp=\(agg.phaseDispatches[phase, default: 0])"
+            if let gpu = agg.phaseGpuSeconds {
+                cell += String(format: " gpu=%.3fs", gpu[phase, default: 0])
+            }
+            return cell
+        }
+        lines.append("\(prefix) S3b encode phases: " + cells.joined(separator: " | "))
+    }
+    if !agg.bufferCounts.isEmpty {
+        let cells = agg.bufferCounts.keys.sorted().map { label -> String in
+            let timed = agg.bufferGpuTimed[label, default: 0]
+            let gpu = timed > 0
+                ? String(format: "%.3fs/%d timed", agg.bufferGpuSeconds[label, default: 0], timed)
+                : "n/a"
+            return "\(label) cb=\(agg.bufferCounts[label, default: 0])"
+                + String(format: " wait=%.3fs", agg.bufferWaitSeconds[label, default: 0])
+                + " gpu=\(gpu)"
+        }
+        lines.append("\(prefix) S3b buffers: " + cells.joined(separator: " | "))
+    }
+    return lines
 }
 
 private func gpuTimingSummary(
@@ -132,7 +196,26 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
         // Metal runtime: weights stay quantized; experts stream via the
         // bounded cache (--cache-gb) when the model is a .qpack container.
         let cacheGB = Double(flagValue(CommandLine.arguments, "--cache-gb") ?? "8") ?? 8
-        model = try QwenMetalModel(modelDir: url, cacheBudgetGB: cacheGB)
+        let metal = try QwenMetalModel(modelDir: url, cacheBudgetGB: cacheGB)
+        // S1b prefill schedule knob: --prefill-chunk N sets the layer-major
+        // chunk size; 0 restores the legacy token-major schedule (A/B runs).
+        // Default (flag absent) is the model's layer-major default.
+        if let chunkFlag = flagValue(CommandLine.arguments, "--prefill-chunk"),
+           let chunk = Int(chunkFlag) {
+            metal.prefillMode = chunk <= 0 ? .tokenMajor : .layerMajor(chunkTokens: chunk)
+        }
+        // S3b follow-up: what the device's counters can actually sample, and
+        // whether the per-phase GPU split is measured or honestly absent.
+        let split: String
+        switch metal.phaseGpuSplitSupport {
+        case .dispatchBoundaryCounters:
+            split = "per-phase GPU split: measured (dispatch-boundary counters)"
+        case .unsupported(let reason):
+            split = "per-phase GPU split: unsupported (\(reason))"
+        }
+        FileHandle.standardError.write(Data(
+            "S3b counters: \(metal.counterSamplingSupport.summary)\n\(split)\n".utf8))
+        model = metal
     } else {
         let cpu = try QwenCPUModel(modelDir: url)
         // --lazy: ~3 GB peak instead of ~10-14 GB, at the cost of re-dequantizing
@@ -159,9 +242,24 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
         if let vs = obj["eos_token_id"] as? [Int] { eos.formUnion(vs) }
     }
 
-    let state = QwenCPUModel.DecodeState()
+    // S6: --load-state resumes a saved context; the prompt/ids are then the
+    // continuation of that sequence (raw tokens, no template). The snapshot
+    // holds state, not the pending logits, so at least one token is needed.
+    let context: any InferenceContext
+    if let loadPath = flagValue(CommandLine.arguments, "--load-state") {
+        guard let persistable = model as? any PersistableInferenceModel else {
+            throw CLIError.statePersistenceUnavailable
+        }
+        let data = try Data(contentsOf: URL(fileURLWithPath: loadPath))
+        context = try persistable.restoreContext(from: data)
+        FileHandle.standardError.write(Data(
+            "loaded state: \(loadPath) (\(data.count) bytes, position \(context.position))\n".utf8))
+    } else {
+        context = model.makeContext()
+    }
+    guard !ids.isEmpty else { throw CLIError.emptyPrompt }
     let prefillStart = Date()
-    var logits = try model.step(ids, state: state)
+    var logits = try model.step(ids, context: context)
     let prefillSecs = -prefillStart.timeIntervalSinceNow
     if let metal = model as? QwenMetalModel {
         let m = metal.lastStepMetrics
@@ -177,6 +275,11 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
             m.logitProjections, m.avoidedLogitProjections
         ) + " gpu=\(gpu)\n"
         FileHandle.standardError.write(Data(line.utf8))
+        var prefillAgg = MetalStepAggregate()
+        prefillAgg.add(m)
+        for extra in phaseSummaryLines("prefill", prefillAgg) {
+            FileHandle.standardError.write(Data((extra + "\n").utf8))
+        }
     } else {
         FileHandle.standardError.write(Data(String(
             format: "prefill: %d tokens in %.1fs\n", ids.count, prefillSecs
@@ -189,7 +292,7 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
     let decodeStart = Date()
     for _ in 0..<maxNew {
         var best = 0
-        for v in 1..<model.config.vocabSize where logits[v] > logits[best] { best = v }
+        for v in 1..<model.vocabSize where logits[v] > logits[best] { best = v }
         if eos.contains(best) { break }
         generated.append(best)
         if let tokenizer {
@@ -205,7 +308,7 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
             print(best, terminator: " ")
             fflush(stdout)
         }
-        logits = try model.step([best], state: state)
+        logits = try model.step([best], context: context)
         if let metal = model as? QwenMetalModel {
             decodeMetal.add(metal.lastStepMetrics)
         }
@@ -220,6 +323,10 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
         format: "decode: %d tokens in %.1fs (%.2f tok/s)\n",
         generated.count, decodeSecs, Double(generated.count) / max(decodeSecs, 0.001)
     ).utf8))
+    // Raw ids, so a resumed run (--load-state --ids ...) can be compared
+    // token for token against an uninterrupted one.
+    FileHandle.standardError.write(Data(
+        "generated ids: \(generated.map(String.init).joined(separator: ","))\n".utf8))
     if model is QwenMetalModel {
         let gpu = gpuTimingSummary(
             seconds: decodeMetal.gpuExecutionSeconds,
@@ -233,6 +340,9 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
             decodeMetal.blockingWaits, decodeMetal.computeDispatchesEncoded
         ) + " gpu=\(gpu)\n"
         FileHandle.standardError.write(Data(line.utf8))
+        for extra in phaseSummaryLines("decode", decodeMetal) {
+            FileHandle.standardError.write(Data((extra + "\n").utf8))
+        }
     }
     if let metal = model as? QwenMetalModel, let cache = metal.expertCache {
         let total = cache.hits + cache.misses
@@ -241,6 +351,29 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
             cache.slotCount, Double(cache.slotCount * cache.stride) / 1_073_741_824,
             cache.hits, cache.misses, total > 0 ? 100 * Double(cache.hits) / Double(total) : 0
         ).utf8))
+    }
+    // S6: --save-state writes the context as it stands after the last
+    // generated token was fed (prompt + every generated token).
+    if let savePath = flagValue(CommandLine.arguments, "--save-state") {
+        guard let persistable = model as? any PersistableInferenceModel else {
+            throw CLIError.statePersistenceUnavailable
+        }
+        let data = try persistable.snapshot(of: context)
+        try data.write(to: URL(fileURLWithPath: savePath), options: .atomic)
+        FileHandle.standardError.write(Data(
+            "saved state: \(savePath) (\(data.count) bytes, position \(context.position))\n".utf8))
+    }
+}
+
+enum CLIError: Swift.Error, CustomStringConvertible {
+    case statePersistenceUnavailable
+    case emptyPrompt
+
+    var description: String {
+        switch self {
+        case .statePersistenceUnavailable: return "this model cannot save or load state"
+        case .emptyPrompt: return "nothing to feed: give --prompt or --ids (a loaded state needs at least one new token)"
+        }
     }
 }
 
@@ -351,10 +484,13 @@ default:
     print("  swiftlet info <model>            model budget summary (\(ArchConfig.known.keys.sorted().joined(separator: " | ")))")
     print("  swiftlet verify <model-dir> <fixtures.safetensors>   compare CPU forward vs mlx fixture")
     print("  swiftlet dump-tensor <model-dir> <module-path> <out.safetensors>   dequantized f32 weights of one module")
-    print("  swiftlet generate <model-dir> --prompt \"...\" [--max-new 32] [--chat] [--gpu] [--cache-gb 8] [--lazy]")
+    print("  swiftlet generate <model-dir> --prompt \"...\" [--max-new 32] [--chat] [--gpu] [--cache-gb 8] [--prefill-chunk 32] [--lazy]")
+    print("                                [--save-state <file>] [--load-state <file>]")
     print("  swiftlet chat <model-dir> [\"turn\" ...] [--max-new 256] [--cache-gb 8] [--greedy] [--system \"...\"]")
     print("")
     print("  --gpu       Metal runtime; on a .qpack container experts stream through a bounded cache")
     print("  --cache-gb  expert cache budget, default 8 (note: swiftlet-server defaults to 2)")
     print("  --lazy      CPU path only: ~3 GB peak instead of ~10-14 GB, slower per step")
+    print("  --save-state  after generating, write the context (KV, DeltaNet state, position) to <file>")
+    print("  --load-state  resume from <file>; --prompt/--ids are then fed as the continuation (docs/STATE_FORMAT.md)")
 }

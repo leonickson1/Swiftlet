@@ -1,21 +1,8 @@
 import Foundation
 
-/// A model that can decode incrementally: CPU reference or Metal runtime.
-public protocol InferenceModel: AnyObject {
-    var config: QwenConfig { get }
-    var modelDir: URL { get }
-    func step(_ tokens: [Int], state: QwenCPUModel.DecodeState) throws -> [Float]
-}
-
-extension QwenCPUModel: InferenceModel {
-    public var modelDir: URL { ckpt.dir }
-}
-
-extension QwenMetalModel: InferenceModel {
-    public var modelDir: URL { ckpt.dir }
-}
-
 /// Engine-agnostic greedy generation loop shared by the CLI and server.
+/// Talks to the model only through InferenceModel: it never sees what the
+/// context holds.
 public final class TextGenerator {
     public let model: any InferenceModel
     public let eosTokens: Set<Int>
@@ -78,20 +65,20 @@ public final class TextGenerator {
     public func generate(promptIds: [Int], maxNew: Int, onToken: (Int) -> Bool) throws -> Stats {
         var stats = Stats()
         stats.promptTokens = promptIds.count
-        let state = QwenCPUModel.DecodeState()
+        let context = model.makeContext()
 
         let prefillStart = Date()
-        var logits = try model.step(promptIds, state: state)
+        var logits = try model.step(promptIds, context: context)
         stats.prefillSeconds = -prefillStart.timeIntervalSinceNow
 
         let decodeStart = Date()
         for _ in 0..<maxNew {
             var best = 0
-            for v in 1..<model.config.vocabSize where logits[v] > logits[best] { best = v }
+            for v in 1..<model.vocabSize where logits[v] > logits[best] { best = v }
             if eosTokens.contains(best) { break }
             stats.generatedTokens += 1
             if !onToken(best) { break }
-            logits = try model.step([best], state: state)
+            logits = try model.step([best], context: context)
         }
         stats.decodeSeconds = -decodeStart.timeIntervalSinceNow
         return stats

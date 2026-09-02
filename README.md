@@ -96,6 +96,14 @@ swift build -c release
 .build/release/swiftlet generate ~/models/qwen3.6-35b.qpack \
   --gpu --chat --prompt "Explain expert streaming in one paragraph."
 
+# Save the conversation state (KV, DeltaNet recurrence, position) and resume
+# it later in a new process, continuing exactly from the saved state
+# (docs/STATE_FORMAT.md):
+.build/release/swiftlet generate ~/models/qwen3.6-35b.qpack \
+  --gpu --prompt "The fieldfare is a bird that" --save-state /tmp/s.swlstate
+.build/release/swiftlet generate ~/models/qwen3.6-35b.qpack \
+  --gpu --prompt " It" --load-state /tmp/s.swlstate
+
 # OpenAI-compatible server (loopback only):
 .build/release/swiftlet-server --model ~/models/qwen3.6-35b.qpack --port 8080
 ```

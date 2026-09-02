@@ -107,13 +107,13 @@ import Testing
         let cpu = try QwenCPUModel(modelDir: src)
         cpu.retainAllLayers = true
         let gpu = try QwenMetalModel(modelDir: viaStream, cacheBudgetGB: 0.05)
-        let s1 = QwenCPUModel.DecodeState()
-        let s2 = QwenCPUModel.DecodeState()
+        let s1 = cpu.makeQwenContext()
+        let s2 = gpu.makeQwenContext()
         var a: [Float] = []
         var b: [Float] = []
         for t in [1, 5, 9] {
-            a = try cpu.step([t], state: s1)
-            b = try gpu.step([t], state: s2)
+            a = try cpu.step([t], context: s1)
+            b = try gpu.step([t], context: s2)
         }
         var maxDiff: Float = 0
         for i in 0..<a.count { maxDiff = max(maxDiff, abs(a[i] - b[i])) }

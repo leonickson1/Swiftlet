@@ -177,20 +177,10 @@ public final class QwenCPUModel {
     }
 
     // MARK: - Decode state (carried across incremental steps)
-
-    /// Per-session recurrent state: grows KV for the GQA layers, fixed-size
-    /// conv tail + delta state for the DeltaNet layers.
-    public final class DecodeState {
-        /// Tokens already processed (RoPE offset for the next step).
-        public internal(set) var position = 0
-        /// layerIndex -> appended K/V rows, laid out [pos][kvHead][headDim].
-        var kv: [Int: (k: [Float], v: [Float])] = [:]
-        /// layerIndex -> last (convKernel-1) rows of mixed qkv, [row][convDim].
-        var convTail: [Int: [Float]] = [:]
-        /// layerIndex -> delta recurrence state, [vHead][vDim][kDim].
-        var deltaState: [Int: [Float]] = [:]
-        public init() {}
-    }
+    //
+    // The per-session state lives in QwenInferenceContext (KV rows for the
+    // GQA layers, conv tail + delta state for the DeltaNet layers); this
+    // model reads and advances it through the internal DecodeState alias.
 
     // MARK: - Forward
 
@@ -207,7 +197,7 @@ public final class QwenCPUModel {
         let S = tokens.count
         let D = cfg.hiddenSize
         var caps = Captures()
-        let state = DecodeState()
+        let state = DecodeState(owner: self)
 
         var h = [Float](repeating: 0, count: S * D)
         for (s, t) in tokens.enumerated() {
@@ -232,10 +222,11 @@ public final class QwenCPUModel {
         return caps
     }
 
-    /// Incremental step: process `tokens` continuing from `state`, returning
+    /// Incremental step: process `tokens` continuing from `context`, returning
     /// the last position's logits. Used for prefill (many tokens) and decode
-    /// (one token at a time).
-    public func step(_ tokens: [Int], state: DecodeState) throws -> [Float] {
+    /// (one token at a time). The context must come from this instance.
+    public func step(_ tokens: [Int], context state: QwenInferenceContext) throws -> [Float] {
+        try state.checkOwner(self)
         let cfg = config
         let S = tokens.count
         let D = cfg.hiddenSize
@@ -255,12 +246,12 @@ public final class QwenCPUModel {
     }
 
     /// One decoder layer: norm -> (DeltaNet | gated GQA) -> residual -> norm -> MoE -> residual.
-    /// Passing a fresh `DecodeState` reproduces the stateless whole-sequence pass.
-    public func layerForward(_ h: [Float], S: Int, layerIndex: Int, state: DecodeState? = nil) throws -> [Float] {
+    /// Passing no context reproduces the stateless whole-sequence pass.
+    public func layerForward(_ h: [Float], S: Int, layerIndex: Int, state: QwenInferenceContext? = nil) throws -> [Float] {
         let cfg = config
         let D = cfg.hiddenSize
         let layer = try layerWeights(layerIndex)
-        let state = state ?? DecodeState()
+        let state = state ?? DecodeState(owner: self)
         var h = h
 
         var x = h

@@ -302,6 +302,430 @@ kernel void gemv_affine_fast8(
     if (lane == 0) y[p.yOff + row] = acc;
 }
 
+// ===== S1b token-batched GEMV: one dispatch applies the same linear to =====
+// many token slots. Each grid slice reads its x/y float offsets from a small
+// offset table (buffer 6, or 4 for the plain variant); the per-row arithmetic
+// is copied verbatim from the single-token kernels above, so every output row
+// is bitwise the value the equivalent unbatched dispatch writes.
+
+kernel void gemv_affine_batch(
+    device const float *x       [[buffer(0)]],
+    device const uchar *w       [[buffer(1)]],
+    device const uchar *scales  [[buffer(2)]],
+    device const uchar *biases  [[buffer(3)]],
+    device float       *y       [[buffer(4)]],
+    constant GemvParams &p      [[buffer(5)]],
+    constant uint2     *offs    [[buffer(6)]],
+    uint2 tpg [[thread_position_in_grid]])
+{
+    const uint row = tpg.x;
+    if (row >= p.outDim) return;
+    const uint xOff = offs[tpg.y].x;
+    const uint yOff = offs[tpg.y].y;
+    const uint perWord = 32 / p.bits;
+    const uint mask = (1u << p.bits) - 1u;
+    const uint packedCols = p.inDim / perWord;   // in uint32 words
+    const uint groups = p.inDim / p.groupSize;
+    const uint wordsPerGroup = p.groupSize / perWord;
+    const ulong rowBase = p.wOff + ulong(row) * packedCols * 4;
+
+    float acc = 0;
+    for (uint g = 0; g < groups; ++g) {
+        float qdot = 0;
+        float xsum = 0;
+        uint base = g * wordsPerGroup;
+        uint xbase = g * p.groupSize;
+        for (uint wi = 0; wi < wordsPerGroup; ++wi) {
+            uint word = load_u32(w, rowBase + ulong(base + wi) * 4);
+            uint xoff = xOff + xbase + wi * perWord;
+            for (uint j = 0; j < perWord; ++j) {
+                float xv = x[xoff + j];
+                qdot += float(word & mask) * xv;
+                xsum += xv;
+                word >>= p.bits;
+            }
+        }
+        uint gi = row * groups + g;
+        acc += load_scale(scales, p.sOff, gi, p.scalesType) * qdot
+             + load_scale(biases, p.bOff, gi, p.scalesType) * xsum;
+    }
+    y[yOff + row] = acc;
+}
+
+kernel void gemv_plain_batch(
+    device const float *x        [[buffer(0)]],
+    device const uchar *w        [[buffer(1)]],
+    device float       *y        [[buffer(2)]],
+    constant GemvPlainParams &p  [[buffer(3)]],
+    constant uint2     *offs     [[buffer(4)]],
+    uint2 tpg [[thread_position_in_grid]])
+{
+    const uint row = tpg.x;
+    if (row >= p.outDim) return;
+    const uint xOff = offs[tpg.y].x;
+    const uint yOff = offs[tpg.y].y;
+    float acc = 0;
+    if (p.dtype == 0) {
+        ulong base = p.wOff + ulong(row) * p.inDim * 4;
+        for (uint i = 0; i < p.inDim; ++i)
+            acc += as_type<float>(load_u32(w, base + ulong(i) * 4)) * x[xOff + i];
+    } else {
+        ulong base = p.wOff + ulong(row) * p.inDim * 2;
+        for (uint i = 0; i < p.inDim; ++i) {
+            ushort u = ushort(w[base + ulong(i) * 2]) | (ushort(w[base + ulong(i) * 2 + 1]) << 8);
+            float wv = (p.dtype == 1) ? float(as_type<half>(u)) : as_type<float>(uint(u) << 16);
+            acc += wv * x[xOff + i];
+        }
+    }
+    y[yOff + row] = acc;
+}
+
+kernel void gemv_affine_fast_batch(
+    device const float *x       [[buffer(0)]],
+    device const uchar *w       [[buffer(1)]],
+    device const uchar *scales  [[buffer(2)]],
+    device const uchar *biases  [[buffer(3)]],
+    device float       *y       [[buffer(4)]],
+    constant GemvParams &p      [[buffer(5)]],
+    constant uint2     *offs    [[buffer(6)]],
+    uint3 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint row = tpg.y;
+    if (row >= p.outDim) return;
+    const uint xOff = offs[tpg.z].x;
+    const uint yOff = offs[tpg.z].y;
+    const uint packedCols = p.inDim / 8;           // uint32 words per row
+    const uint groups = p.inDim / p.groupSize;
+    const uint wordsPerGroup = p.groupSize / 8;
+    device const uint *wr = (device const uint *)(w + p.wOff + ulong(row) * packedCols * 4);
+
+    float acc = 0;
+    for (uint g = lane; g < groups; g += 32) {
+        float qdot = 0;
+        float xsum = 0;
+        uint base = g * wordsPerGroup;
+        uint xbase = xOff + g * p.groupSize;
+        for (uint wi = 0; wi < wordsPerGroup; ++wi) {
+            uint word = wr[base + wi];
+            uint xo = xbase + wi * 8;
+            qdot += float(word & 0xF) * x[xo]
+                  + float((word >> 4) & 0xF) * x[xo + 1]
+                  + float((word >> 8) & 0xF) * x[xo + 2]
+                  + float((word >> 12) & 0xF) * x[xo + 3]
+                  + float((word >> 16) & 0xF) * x[xo + 4]
+                  + float((word >> 20) & 0xF) * x[xo + 5]
+                  + float((word >> 24) & 0xF) * x[xo + 6]
+                  + float((word >> 28) & 0xF) * x[xo + 7];
+            xsum += x[xo] + x[xo+1] + x[xo+2] + x[xo+3] + x[xo+4] + x[xo+5] + x[xo+6] + x[xo+7];
+        }
+        uint gi = row * groups + g;
+        acc += load_scale(scales, p.sOff, gi, p.scalesType) * qdot
+             + load_scale(biases, p.bOff, gi, p.scalesType) * xsum;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) y[yOff + row] = acc;
+}
+
+kernel void gemv_affine_fast8_batch(
+    device const float *x       [[buffer(0)]],
+    device const uchar *w       [[buffer(1)]],
+    device const uchar *scales  [[buffer(2)]],
+    device const uchar *biases  [[buffer(3)]],
+    device float       *y       [[buffer(4)]],
+    constant GemvParams &p      [[buffer(5)]],
+    constant uint2     *offs    [[buffer(6)]],
+    uint3 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint row = tpg.y;
+    if (row >= p.outDim) return;
+    const uint xOff = offs[tpg.z].x;
+    const uint yOff = offs[tpg.z].y;
+    const uint packedCols = p.inDim / 4;           // uint32 words per row
+    const uint groups = p.inDim / p.groupSize;
+    const uint wordsPerGroup = p.groupSize / 4;
+    device const uint *wr = (device const uint *)(w + p.wOff + ulong(row) * packedCols * 4);
+
+    float acc = 0;
+    for (uint g = lane; g < groups; g += 32) {
+        float qdot = 0;
+        float xsum = 0;
+        uint base = g * wordsPerGroup;
+        uint xbase = xOff + g * p.groupSize;
+        for (uint wi = 0; wi < wordsPerGroup; ++wi) {
+            uint word = wr[base + wi];
+            uint xo = xbase + wi * 4;
+            qdot += float(word & 0xFF) * x[xo]
+                  + float((word >> 8) & 0xFF) * x[xo + 1]
+                  + float((word >> 16) & 0xFF) * x[xo + 2]
+                  + float((word >> 24) & 0xFF) * x[xo + 3];
+            xsum += x[xo] + x[xo+1] + x[xo+2] + x[xo+3];
+        }
+        uint gi = row * groups + g;
+        acc += load_scale(scales, p.sOff, gi, p.scalesType) * qdot
+             + load_scale(biases, p.bOff, gi, p.scalesType) * xsum;
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) y[yOff + row] = acc;
+}
+
+// ===== S2 full attention: q prep, KV append, gated causal GQA softmax. =====
+// Replaces the fast path's CPU attention core. RoPE trig uses precise::
+// variants so angles match the CPU's libm within float rounding.
+
+// Extract each head's query from the interleaved q|gate projection
+// (per head [q(hd) | gate(hd)] at srcOff), RMSNorm with wgt, apply partial
+// RoPE for one position, write flat rows at dstOff. One simdgroup per head;
+// the gate half stays untouched for attn_decode_gqa.
+struct AttnPrepParams {
+    uint heads;
+    uint headDim;
+    uint rot;       // rotary dims (<= headDim)
+    float eps;
+    float theta;
+    uint position;
+    uint srcOff;
+    uint dstOff;
+};
+
+inline void rope_row(device float *row, uint rot, uint position, float theta, uint lane) {
+    const uint half_ = rot / 2;
+    for (uint j = lane; j < half_; j += 32) {
+        float invFreq = metal::precise::pow(theta, -float(2 * j) / float(rot));
+        float angle = float(position) * invFreq;
+        float c = metal::precise::cos(angle);
+        float sn = metal::precise::sin(angle);
+        float a = row[j];
+        float b = row[half_ + j];
+        row[j] = a * c - b * sn;
+        row[half_ + j] = b * c + a * sn;
+    }
+}
+
+kernel void attn_q_prep(
+    device float       *data [[buffer(0)]],
+    device const float *wgt  [[buffer(1)]],
+    constant AttnPrepParams &p [[buffer(2)]],
+    uint2 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint head = tpg.y;
+    if (head >= p.heads) return;
+    device const float *src = data + p.srcOff + head * 2 * p.headDim;
+    device float *dst = data + p.dstOff + head * p.headDim;
+    float ss = 0;
+    for (uint i = lane; i < p.headDim; i += 32) ss += src[i] * src[i];
+    ss = simd_sum(ss);
+    const float inv = metal::rsqrt(ss / float(p.headDim) + p.eps);
+    for (uint i = lane; i < p.headDim; i += 32) dst[i] = src[i] * inv * wgt[i];
+    // RoPE pairs (j, j+rot/2) cross lanes; make the normed writes visible.
+    simdgroup_barrier(metal::mem_flags::mem_device);
+    rope_row(dst, p.rot, p.position, p.theta, lane);
+}
+
+// Append one position's K/V rows into the caches at row index `position`
+// (layout [position][kvHead][headDim], the CPU reference layout): K is
+// RMSNormed with wgt then roped, V copies verbatim. One simdgroup per kv head.
+struct AttnKVParams {
+    uint kvHeads;
+    uint headDim;
+    uint rot;
+    float eps;
+    float theta;
+    uint position;
+    uint kSrcOff;
+    uint vSrcOff;
+};
+
+kernel void attn_kv_append(
+    device float       *data   [[buffer(0)]],
+    device const float *wgt    [[buffer(1)]],
+    device float       *kCache [[buffer(2)]],
+    device float       *vCache [[buffer(3)]],
+    constant AttnKVParams &p   [[buffer(4)]],
+    uint2 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint head = tpg.y;
+    if (head >= p.kvHeads) return;
+    device const float *kSrc = data + p.kSrcOff + head * p.headDim;
+    device const float *vSrc = data + p.vSrcOff + head * p.headDim;
+    const ulong row = (ulong(p.position) * p.kvHeads + head) * p.headDim;
+    device float *kDst = kCache + row;
+    device float *vDst = vCache + row;
+    float ss = 0;
+    for (uint i = lane; i < p.headDim; i += 32) ss += kSrc[i] * kSrc[i];
+    ss = simd_sum(ss);
+    const float inv = metal::rsqrt(ss / float(p.headDim) + p.eps);
+    for (uint i = lane; i < p.headDim; i += 32) {
+        kDst[i] = kSrc[i] * inv * wgt[i];
+        vDst[i] = vSrc[i];
+    }
+    simdgroup_barrier(metal::mem_flags::mem_device);
+    rope_row(kDst, p.rot, p.position, p.theta, lane);
+}
+
+// Gated causal GQA attention core, shared by attn_decode_gqa and its
+// token-grid batch twin: out = sigmoid(gate) * softmax(q K^T / sqrt(hd)) V
+// over cache rows [0, kvLen), online softmax in f32 throughout. The KV loop
+// is tiled across ATTN_DECODE_SG simdgroups per (head, token): simdgroup g
+// scans rows g, g + SG, ... with its own running (max, sum, accumulator),
+// merged once at the end through threadgroup memory — each partial rescaled
+// by exp(m_g - M) against the global max, the same f32 correction the
+// online recurrence applies per row (a simdgroup whose row subset was empty
+// contributes exp(-inf - M) = 0). K/V rows are read as float4 when
+// headDim % 4 == 0 (cache rows are 16-byte aligned then; q is preloaded
+// into registers either way, so scratch offsets never need alignment); odd
+// head dims keep the lane-strided scalar loop. Per-lane accumulators and
+// the threadgroup tile cover headDim <= 256.
+#define ATTN_DECODE_SG 8
+
+inline void attn_decode_head(
+    device float *data,
+    device const float *kCache,
+    device const float *vCache,
+    uint kvHeads, uint headDim, uint kvLen,
+    uint qOff, uint gateOff, uint outOff, uint kvHead,
+    uint sg, uint lane,
+    threadgroup float *tgM, threadgroup float *tgS, threadgroup float4 *tgAcc)
+{
+    device const float *q = data + qOff;
+    const float scale = metal::rsqrt(float(headDim));
+    const bool vec = headDim % 4 == 0;
+    const uint hd4 = headDim / 4;
+
+    float m = -INFINITY;
+    float s = 0;
+    float4 acc4[2] = {float4(0.0f), float4(0.0f)};
+    float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    float4 q4[2] = {float4(0.0f), float4(0.0f)};
+    float qs[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    uint cnt = 0;
+    if (vec) {
+        for (uint i = lane; i < hd4; i += 32) {
+            q4[cnt++] = float4(q[4 * i], q[4 * i + 1], q[4 * i + 2], q[4 * i + 3]);
+        }
+    } else {
+        for (uint i = lane; i < headDim; i += 32) qs[cnt++] = q[i];
+    }
+
+    for (uint sj = sg; sj < kvLen; sj += ATTN_DECODE_SG) {
+        const ulong row = (ulong(sj) * kvHeads + kvHead) * headDim;
+        float dot = 0;
+        if (vec) {
+            device const float4 *kr = (device const float4 *)(kCache + row);
+            cnt = 0;
+            for (uint i = lane; i < hd4; i += 32) dot += metal::dot(q4[cnt++], kr[i]);
+        } else {
+            device const float *kr = kCache + row;
+            cnt = 0;
+            for (uint i = lane; i < headDim; i += 32) dot += qs[cnt++] * kr[i];
+        }
+        dot = simd_sum(dot) * scale;
+        const float mNew = metal::max(m, dot);
+        const float corr = metal::exp(m - mNew);   // first row: exp(-inf) = 0
+        const float w = metal::exp(dot - mNew);
+        s = s * corr + w;
+        if (vec) {
+            device const float4 *vr = (device const float4 *)(vCache + row);
+            cnt = 0;
+            for (uint i = lane; i < hd4; i += 32) {
+                acc4[cnt] = acc4[cnt] * corr + w * vr[i];
+                ++cnt;
+            }
+        } else {
+            device const float *vr = vCache + row;
+            cnt = 0;
+            for (uint i = lane; i < headDim; i += 32) {
+                acc[cnt] = acc[cnt] * corr + w * vr[i];
+                ++cnt;
+            }
+        }
+        m = mNew;
+    }
+
+    if (lane == 0) {
+        tgM[sg] = m;
+        tgS[sg] = s;
+    }
+    threadgroup float *tgAccF = (threadgroup float *)tgAcc;
+    if (vec) {
+        cnt = 0;
+        for (uint i = lane; i < hd4; i += 32) tgAcc[sg * hd4 + i] = acc4[cnt++];
+    } else {
+        cnt = 0;
+        for (uint i = lane; i < headDim; i += 32) tgAccF[sg * headDim + i] = acc[cnt++];
+    }
+    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+
+    float M = tgM[0];
+    for (uint g = 1; g < ATTN_DECODE_SG; ++g) M = metal::max(M, tgM[g]);
+    float sTot = 0;
+    for (uint g = 0; g < ATTN_DECODE_SG; ++g) sTot += tgS[g] * metal::exp(tgM[g] - M);
+    const float invS = 1.0f / sTot;
+    if (sg != 0) return;
+    device const float *gate = data + gateOff;
+    device float *out = data + outOff;
+    if (vec) {
+        for (uint i = lane; i < hd4; i += 32) {
+            float4 a = float4(0.0f);
+            for (uint g = 0; g < ATTN_DECODE_SG; ++g) {
+                a += tgAcc[g * hd4 + i] * metal::exp(tgM[g] - M);
+            }
+            for (uint j = 0; j < 4; ++j) {
+                const float gv = gate[4 * i + j];
+                out[4 * i + j] = a[j] * invS * (1.0f / (1.0f + metal::exp(-gv)));
+            }
+        }
+    } else {
+        for (uint i = lane; i < headDim; i += 32) {
+            float a = 0;
+            for (uint g = 0; g < ATTN_DECODE_SG; ++g) {
+                a += tgAccF[g * headDim + i] * metal::exp(tgM[g] - M);
+            }
+            const float gv = gate[i];
+            out[i] = a * invS * (1.0f / (1.0f + metal::exp(-gv)));
+        }
+    }
+}
+
+// Gated causal GQA attention for one query token over cache rows [0, kvLen),
+// via the tiled core above. One threadgroup of ATTN_DECODE_SG simdgroups
+// per query head; headDim <= 256.
+struct AttnDecodeParams {
+    uint heads;
+    uint kvHeads;
+    uint headDim;
+    uint kvLen;
+    uint qOff;      // prepped q rows (head * headDim)
+    uint qoutOff;   // raw interleaved projection; gate at head*2*hd + hd
+    uint outOff;    // gated context rows (head * headDim)
+};
+
+kernel void attn_decode_gqa(
+    device float       *data   [[buffer(0)]],
+    device const float *kCache [[buffer(1)]],
+    device const float *vCache [[buffer(2)]],
+    constant AttnDecodeParams &p [[buffer(3)]],
+    uint2 tpg [[thread_position_in_grid]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float tgM[ATTN_DECODE_SG];
+    threadgroup float tgS[ATTN_DECODE_SG];
+    threadgroup float4 tgAcc[ATTN_DECODE_SG * 64];
+    const uint head = tpg.y;
+    if (head >= p.heads) return;
+    attn_decode_head(
+        data, kCache, vCache, p.kvHeads, p.headDim, p.kvLen,
+        p.qOff + head * p.headDim,
+        p.qoutOff + head * 2 * p.headDim + p.headDim,
+        p.outOff + head * p.headDim,
+        head / (p.heads / p.kvHeads),
+        sg, lane, tgM, tgS, tgAcc);
+}
+
 // ===== Small glue kernels so a token needs few command buffers. =====
 
 // RMSNorm over `rows` rows of `dim`, in place at data[off...]. Optional
@@ -364,6 +788,49 @@ kernel void conv_step(
     }
     hist[(p.K - 2) * p.convDim + c] = xNew;
     data[p.outOff + c] = acc / (1.0f + metal::exp(-acc));
+}
+
+// Cross-token conv scan (S1b): T conv_step iterations in one dispatch, one
+// thread per channel — token t's row read at inOff + t*stride and written
+// at outOff + t*stride. Each iteration is the single-step kernel's
+// arithmetic verbatim, with the K-1 history rows carried across tokens in
+// registers instead of a barrier-fenced device round trip per token, so
+// every output row and the final history are bitwise the chained steps'.
+// History registers cover 2 <= K <= 8 (target checkpoints use K = 4).
+struct ConvScanParams {
+    uint convDim;
+    uint K;
+    uint inOff;
+    uint outOff;
+    uint stride;
+    uint T;
+};
+
+kernel void conv_scan(
+    device float       *data [[buffer(0)]],
+    device float       *hist [[buffer(1)]],
+    device const float *wgt  [[buffer(2)]],   // (convDim, K)
+    constant ConvScanParams &p [[buffer(3)]],
+    uint c [[thread_position_in_grid]])
+{
+    if (c >= p.convDim) return;
+    float h[7];
+    for (uint j = 0; j + 1 < p.K; ++j) h[j] = hist[j * p.convDim + c];
+    uint inOff = p.inOff;
+    uint outOff = p.outOff;
+    for (uint t = 0; t < p.T; ++t) {
+        float xNew = data[inOff + c];
+        float acc = wgt[c * p.K + (p.K - 1)] * xNew;
+        for (uint j = 0; j + 1 < p.K; ++j) {
+            acc += wgt[c * p.K + j] * h[j];
+        }
+        for (uint j = 0; j + 2 < p.K; ++j) h[j] = h[j + 1];
+        h[p.K - 2] = xNew;
+        data[outOff + c] = acc / (1.0f + metal::exp(-acc));
+        inOff += p.stride;
+        outOff += p.stride;
+    }
+    for (uint j = 0; j + 1 < p.K; ++j) hist[j * p.convDim + c] = h[j];
 }
 
 // g = exp(-exp(A_log) * softplus(a + dt_bias)); beta = sigmoid(b).
@@ -477,6 +944,365 @@ kernel void weighted_accum(
     h[i] += acc;
 }
 
+// ===== S1b batch twins for the per-token glue kernels above. The chunked
+// prefill's per-token destinations are slot-regular (token t's rows sit
+// exactly `stride` floats after token t-1's), so instead of an offset table
+// each twin gains a token grid dimension plus stride parameters. Bodies are
+// the single-token kernels' verbatim, so every token's rows are bitwise the
+// values the equivalent per-token dispatch writes.
+
+// norm_copy over n hidden rows: row t reads h[t*hStride...] and writes
+// dst[dstOff + t*dstStride...]. One simdgroup per row.
+struct NormCopyBatchParams {
+    uint dim;
+    float eps;
+    uint dstOff;
+    uint dstStride;
+    uint hStride;
+};
+
+kernel void norm_copy_batch(
+    device const float *h    [[buffer(0)]],
+    device float       *dst  [[buffer(1)]],
+    device const float *wgt  [[buffer(2)]],
+    constant NormCopyBatchParams &p [[buffer(3)]],
+    uint2 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    device const float *hr = h + tpg.y * p.hStride;
+    device float *dr = dst + p.dstOff + tpg.y * p.dstStride;
+    float ss = 0;
+    for (uint i = lane; i < p.dim; i += 32) ss += hr[i] * hr[i];
+    ss = simd_sum(ss);
+    float inv = metal::rsqrt(ss / float(p.dim) + p.eps);
+    for (uint i = lane; i < p.dim; i += 32) {
+        dr[i] = hr[i] * inv * wgt[i];
+    }
+}
+
+// silu_mul over n token slots: slot t adds t*stride to every offset.
+kernel void silu_mul_batch(
+    device const float *g  [[buffer(0)]],
+    device const float *u  [[buffer(1)]],
+    device float       *h  [[buffer(2)]],
+    constant uint4     &po [[buffer(3)]],   // (count, gOff, uOff, dstOff)
+    constant uint      &stride [[buffer(4)]],
+    uint2 tpg [[thread_position_in_grid]])
+{
+    const uint i = tpg.x;
+    if (i >= po.x) return;
+    const uint b = tpg.y * stride;
+    float gv = g[po.y + b + i];
+    h[po.w + b + i] = (gv / (1.0f + metal::exp(-gv))) * u[po.z + b + i];
+}
+
+// add_inplace over n hidden rows: h[t*hStride + i] += r[rOff + t*rStride + i].
+kernel void add_inplace_batch(
+    device float       *h  [[buffer(0)]],
+    device const float *r  [[buffer(1)]],
+    constant uint4     &po [[buffer(2)]],   // (count, rOff, hStride, rStride)
+    uint2 tpg [[thread_position_in_grid]])
+{
+    const uint i = tpg.x;
+    if (i >= po.x) return;
+    h[tpg.y * po.z + i] += r[po.y + tpg.y * po.w + i];
+}
+
+// weighted_accum over n tokens: token t reads its expert/shared rows at
+// t*stride, its own K weights at wk[t*K...], and accumulates into hidden row
+// t*hStride. The per-token K-expert accumulation order stays inside the
+// kernel, exactly the single-token loop.
+struct AccumBatchParams {
+    uint D;
+    uint K;
+    uint dBase;
+    uint shOff;
+    uint gateOff;
+    uint stride;    // scratch slot stride, floats
+    uint hStride;   // hidden row stride, floats
+};
+
+kernel void weighted_accum_batch(
+    device float       *h    [[buffer(0)]],
+    device const float *data [[buffer(1)]],
+    constant AccumBatchParams &p [[buffer(2)]],
+    constant float     *wk   [[buffer(3)]],   // n*K weights, token-major
+    uint2 tpg [[thread_position_in_grid]])
+{
+    const uint i = tpg.x;
+    if (i >= p.D) return;
+    const uint t = tpg.y;
+    const uint b = t * p.stride;
+    float acc = 0;
+    for (uint k = 0; k < p.K; ++k) {
+        acc += wk[t * p.K + k] * data[p.dBase + b + k * p.D + i];
+    }
+    float gl = data[p.gateOff + b];
+    acc += (1.0f / (1.0f + metal::exp(-gl))) * data[p.shOff + b + i];
+    h[t * p.hStride + i] += acc;
+}
+
+// attn_q_prep over n tokens: token t works inside its own slot stride at
+// position p.position + t. One simdgroup per (head, token).
+struct AttnPrepBatchParams {
+    uint heads;
+    uint headDim;
+    uint rot;
+    float eps;
+    float theta;
+    uint position;   // base; token t uses position + t
+    uint srcOff;
+    uint dstOff;
+    uint stride;
+};
+
+kernel void attn_q_prep_batch(
+    device float       *data [[buffer(0)]],
+    device const float *wgt  [[buffer(1)]],
+    constant AttnPrepBatchParams &p [[buffer(2)]],
+    uint3 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint head = tpg.y;
+    if (head >= p.heads) return;
+    const uint t = tpg.z;
+    device const float *src = data + p.srcOff + t * p.stride + head * 2 * p.headDim;
+    device float *dst = data + p.dstOff + t * p.stride + head * p.headDim;
+    float ss = 0;
+    for (uint i = lane; i < p.headDim; i += 32) ss += src[i] * src[i];
+    ss = simd_sum(ss);
+    const float inv = metal::rsqrt(ss / float(p.headDim) + p.eps);
+    for (uint i = lane; i < p.headDim; i += 32) dst[i] = src[i] * inv * wgt[i];
+    simdgroup_barrier(metal::mem_flags::mem_device);
+    rope_row(dst, p.rot, p.position + t, p.theta, lane);
+}
+
+// attn_kv_append over n tokens: token t appends at cache row index
+// p.position + t — rows are disjoint per token, so batching cannot reorder
+// any write. One simdgroup per (kv head, token).
+struct AttnKVBatchParams {
+    uint kvHeads;
+    uint headDim;
+    uint rot;
+    float eps;
+    float theta;
+    uint position;   // base; token t appends at position + t
+    uint kSrcOff;
+    uint vSrcOff;
+    uint stride;
+};
+
+kernel void attn_kv_append_batch(
+    device float       *data   [[buffer(0)]],
+    device const float *wgt    [[buffer(1)]],
+    device float       *kCache [[buffer(2)]],
+    device float       *vCache [[buffer(3)]],
+    constant AttnKVBatchParams &p [[buffer(4)]],
+    uint3 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint head = tpg.y;
+    if (head >= p.kvHeads) return;
+    const uint t = tpg.z;
+    device const float *kSrc = data + p.kSrcOff + t * p.stride + head * p.headDim;
+    device const float *vSrc = data + p.vSrcOff + t * p.stride + head * p.headDim;
+    const ulong row = (ulong(p.position + t) * p.kvHeads + head) * p.headDim;
+    device float *kDst = kCache + row;
+    device float *vDst = vCache + row;
+    float ss = 0;
+    for (uint i = lane; i < p.headDim; i += 32) ss += kSrc[i] * kSrc[i];
+    ss = simd_sum(ss);
+    const float inv = metal::rsqrt(ss / float(p.headDim) + p.eps);
+    for (uint i = lane; i < p.headDim; i += 32) {
+        kDst[i] = kSrc[i] * inv * wgt[i];
+        vDst[i] = vSrc[i];
+    }
+    simdgroup_barrier(metal::mem_flags::mem_device);
+    rope_row(kDst, p.rot, p.position + t, p.theta, lane);
+}
+
+// attn_decode_gqa over n tokens: token t reads its prepped q and gate rows
+// inside its own slot stride and attends over cache rows
+// [0, position + t + 1) — the causal kvLen derived from the token grid, so
+// one dispatch covers the whole chunk once every KV append has landed
+// (callers barrier between the appends and this). Per-token arithmetic is
+// the single-token kernel's verbatim: both run the tiled attn_decode_head
+// core. One threadgroup of ATTN_DECODE_SG simdgroups per (head, token).
+struct AttnDecodeBatchParams {
+    uint heads;
+    uint kvHeads;
+    uint headDim;
+    uint position;  // base; token t attends over position + t + 1 rows
+    uint qOff;      // prepped q rows (head * headDim)
+    uint qoutOff;   // raw interleaved projection; gate at head*2*hd + hd
+    uint outOff;    // gated context rows (head * headDim)
+    uint stride;
+};
+
+kernel void attn_decode_gqa_batch(
+    device float       *data   [[buffer(0)]],
+    device const float *kCache [[buffer(1)]],
+    device const float *vCache [[buffer(2)]],
+    constant AttnDecodeBatchParams &p [[buffer(3)]],
+    uint3 tpg [[thread_position_in_grid]],
+    uint sg   [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    threadgroup float tgM[ATTN_DECODE_SG];
+    threadgroup float tgS[ATTN_DECODE_SG];
+    threadgroup float4 tgAcc[ATTN_DECODE_SG * 64];
+    const uint head = tpg.y;
+    if (head >= p.heads) return;
+    const uint b = tpg.z * p.stride;
+    attn_decode_head(
+        data, kCache, vCache, p.kvHeads, p.headDim, p.position + tpg.z + 1,
+        p.qOff + b + head * p.headDim,
+        p.qoutOff + b + head * 2 * p.headDim + p.headDim,
+        p.outOff + b + head * p.headDim,
+        head / (p.heads / p.kvHeads),
+        sg, lane, tgM, tgS, tgAcc);
+}
+
+// delta_pre over n token slots: slot t adds t*stride to every offset;
+// per-slot arithmetic is the single-token kernel's verbatim (aLog/dtBias
+// are shared weights).
+struct DeltaPreBatchParams {
+    uint nv;
+    uint aOff;
+    uint bOff;
+    uint outOff;   // g at outOff, beta at outOff + nv
+    uint stride;
+};
+
+kernel void delta_pre_batch(
+    device float       *data   [[buffer(0)]],
+    device const float *aLog   [[buffer(1)]],
+    device const float *dtBias [[buffer(2)]],
+    constant DeltaPreBatchParams &p [[buffer(3)]],
+    uint2 tpg [[thread_position_in_grid]])
+{
+    const uint i = tpg.x;
+    if (i >= p.nv) return;
+    const uint b = tpg.y * p.stride;
+    float av = data[p.aOff + b + i] + dtBias[i];
+    float sp = av > 20.0f ? av : metal::log(1.0f + metal::exp(av));
+    data[p.outOff + b + i] = metal::exp(-metal::exp(aLog[i]) * sp);
+    float bv = data[p.bOff + b + i];
+    data[p.outOff + b + p.nv + i] = 1.0f / (1.0f + metal::exp(-bv));
+}
+
+// rmsnorm_rows over n token slots: slot t norms its `rows` rows in place at
+// off + t*stride. One simdgroup per (row, token).
+struct NormBatchParams {
+    uint rows;
+    uint dim;
+    float eps;
+    uint hasWeight;
+    float scale;
+    uint off;
+    uint stride;
+};
+
+kernel void rmsnorm_rows_batch(
+    device float       *data [[buffer(0)]],
+    device const float *wgt  [[buffer(1)]],
+    constant NormBatchParams &p [[buffer(2)]],
+    uint3 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint row = tpg.y;
+    if (row >= p.rows) return;
+    device float *r = data + p.off + tpg.z * p.stride + row * p.dim;
+    float ss = 0;
+    for (uint i = lane; i < p.dim; i += 32) ss += r[i] * r[i];
+    ss = simd_sum(ss);
+    float inv = metal::rsqrt(ss / float(p.dim) + p.eps) * p.scale;
+    for (uint i = lane; i < p.dim; i += 32) {
+        r[i] = p.hasWeight ? r[i] * inv * wgt[i] : r[i] * inv;
+    }
+}
+
+// gated_norm_mul over n tokens. The chunked recurrence reads y rows from
+// the contiguous [T, row] staging block while z and the output stay in the
+// per-token slots, so each stream carries its own stride. One simdgroup per
+// (v-head, token).
+struct GatedNormBatchParams {
+    uint nv;
+    uint dv;
+    float eps;
+    uint yOff;
+    uint zOff;
+    uint outOff;
+    uint yStride;
+    uint zStride;
+    uint outStride;
+};
+
+kernel void gated_norm_mul_batch(
+    device float       *data [[buffer(0)]],
+    device const float *wgt  [[buffer(1)]],   // (dv)
+    constant GatedNormBatchParams &p [[buffer(2)]],
+    uint3 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    const uint hv = tpg.y;
+    if (hv >= p.nv) return;
+    const uint t = tpg.z;
+    device float *yr = data + p.yOff + t * p.yStride + hv * p.dv;
+    device float *zr = data + p.zOff + t * p.zStride + hv * p.dv;
+    device float *outr = data + p.outOff + t * p.outStride + hv * p.dv;
+    float ss = 0;
+    for (uint i = lane; i < p.dv; i += 32) ss += yr[i] * yr[i];
+    ss = simd_sum(ss);
+    float inv = metal::rsqrt(ss / float(p.dv) + p.eps);
+    for (uint i = lane; i < p.dv; i += 32) {
+        float zv = zr[i];
+        outr[i] = yr[i] * inv * wgt[i] * (zv / (1.0f + metal::exp(-zv)));
+    }
+}
+
+// ===== S1b chunked DeltaNet staging: pack every chunk token's normed
+// q/k/v conv rows and g/beta pairs from slot-strided regions into the
+// contiguous [T, row] blocks gated_delta_step's T-step scan expects. Pure
+// element copies with no arithmetic, so staging cannot perturb numerics.
+struct DeltaGatherParams {
+    uint keyDim;
+    uint valueDim;
+    uint nv;
+    uint slotStride;
+    uint convOff;   // slot conv rows: [q(keyDim) | k(keyDim) | v(valueDim)]
+    uint gbOff;     // slot decay/beta rows: [g(nv) | beta(nv)]
+    uint qOut;
+    uint kOut;
+    uint vOut;
+    uint gOut;
+    uint bOut;
+};
+
+kernel void delta_gather(
+    device float *data [[buffer(0)]],
+    constant DeltaGatherParams &p [[buffer(1)]],
+    uint2 tpg [[thread_position_in_grid]])
+{
+    const uint i = tpg.x;
+    const uint t = tpg.y;
+    const uint slot = t * p.slotStride;
+    const uint convWidth = 2 * p.keyDim + p.valueDim;
+    if (i < p.keyDim) {
+        data[p.qOut + t * p.keyDim + i] = data[slot + p.convOff + i];
+    } else if (i < 2 * p.keyDim) {
+        data[p.kOut + t * p.keyDim + (i - p.keyDim)] = data[slot + p.convOff + i];
+    } else if (i < convWidth) {
+        data[p.vOut + t * p.valueDim + (i - 2 * p.keyDim)] = data[slot + p.convOff + i];
+    } else if (i < convWidth + p.nv) {
+        const uint j = i - convWidth;
+        data[p.gOut + t * p.nv + j] = data[slot + p.gbOff + j];
+    } else if (i < convWidth + 2 * p.nv) {
+        const uint j = i - convWidth - p.nv;
+        data[p.bOut + t * p.nv + j] = data[slot + p.gbOff + p.nv + j];
+    }
+}
+
 // qwen3_next fused projections: de-interleave the per-k-head packed
 // [q(dk) | k(dk) | v(rep*dv) | z(rep*dv)] layout plus [b(rep) | a(rep)] into
 // flat regions [q|k|v], z, b, a (what the conv/delta pipeline consumes).
@@ -515,5 +1341,49 @@ kernel void deinterleave_qkvz(
         const uint baSrc = p.baOff + hk * 2 * p.rep;
         data[p.bOff + hk * p.rep + ri] = data[baSrc + ri];
         data[p.aOff + hk * p.rep + ri] = data[baSrc + p.rep + ri];
+    }
+}
+
+// deinterleave_qkvz over n token slots (S1b batch twin): slot t adds
+// t*stride to every source and destination offset; per-slot copies are the
+// single-token kernel's verbatim.
+struct DeintBatchParams {
+    uint nk;
+    uint dk;
+    uint rep;
+    uint dv;
+    uint keyDim;
+    uint srcOff;
+    uint baOff;
+    uint qkvOff;
+    uint zOff;
+    uint bOff;
+    uint aOff;
+    uint stride;
+};
+
+kernel void deinterleave_qkvz_batch(
+    device float        *data [[buffer(0)]],
+    constant DeintBatchParams &p [[buffer(1)]],
+    uint2 tpg [[thread_position_in_grid]])
+{
+    const uint hk = tpg.x;
+    if (hk >= p.nk) return;
+    const uint b = tpg.y * p.stride;
+    const uint chunk = 2 * p.dk + 2 * p.rep * p.dv;
+    const uint src = p.srcOff + b + hk * chunk;
+    for (uint i = 0; i < p.dk; ++i) {
+        data[p.qkvOff + b + hk * p.dk + i] = data[src + i];
+        data[p.qkvOff + b + p.keyDim + hk * p.dk + i] = data[src + p.dk + i];
+    }
+    for (uint ri = 0; ri < p.rep; ++ri) {
+        const uint hv = hk * p.rep + ri;
+        for (uint i = 0; i < p.dv; ++i) {
+            data[p.qkvOff + b + 2 * p.keyDim + hv * p.dv + i] = data[src + 2 * p.dk + ri * p.dv + i];
+            data[p.zOff + b + hv * p.dv + i] = data[src + 2 * p.dk + p.rep * p.dv + ri * p.dv + i];
+        }
+        const uint baSrc = p.baOff + b + hk * 2 * p.rep;
+        data[p.bOff + b + hk * p.rep + ri] = data[baSrc + ri];
+        data[p.aOff + b + hk * p.rep + ri] = data[baSrc + p.rep + ri];
     }
 }

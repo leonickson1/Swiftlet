@@ -81,6 +81,7 @@ public final class SwiftletSession: @unchecked Sendable {
         print("[SwiftletSession] tokenizer ok; building Metal model...")
         if let gpu = try? QwenMetalModel(modelDir: modelDir, cacheBudgetGB: cacheBudgetGB) {
             model = gpu
+            config = gpu.config
             usesGPU = true
             print("[SwiftletSession] Metal model ready")
         } else {
@@ -88,9 +89,10 @@ public final class SwiftletSession: @unchecked Sendable {
             let cpu = try QwenCPUModel(modelDir: modelDir)
             cpu.retainAllLayers = retainAllLayers
             model = cpu
+            config = cpu.config
             usesGPU = false
         }
-        config = model.config
+        convState = model.makeContext()
         generator = TextGenerator(model: model)
         // Special tokens (think tags, chat markup, FIM markers, vision and
         // tool tags) are never legitimate chat output, but a model pushed off
@@ -133,14 +135,14 @@ public final class SwiftletSession: @unchecked Sendable {
     // extend the cached conversation is decided by comparing message content,
     // not template tokens: the re-rendered template drops the think block from
     // past assistant turns, so token-prefix comparison always diverges.
-    private var convState = QwenCPUModel.DecodeState()
+    private let convState: any InferenceContext
     private var lastMessages: [[String: String]] = []
     private var lastReplyText = ""
     private var statePrimed = false
 
     /// Drops the cached conversation (e.g. when the user starts a new chat).
     public func resetConversation() {
-        convState = QwenCPUModel.DecodeState()
+        convState.reset()
         lastMessages = []
         lastReplyText = ""
         statePrimed = false
@@ -354,7 +356,7 @@ public final class SwiftletSession: @unchecked Sendable {
                     var printed = ""
                     var cleanEnd = false
 
-                    var logits = try self.model.step(suffix, state: self.convState)
+                    var logits = try self.model.step(suffix, context: self.convState)
                     let prefillDone = Date()
 
                     var decodeSeconds = 0.0
@@ -407,7 +409,7 @@ public final class SwiftletSession: @unchecked Sendable {
                             printed = newPrinted
                         }
                         let t0 = Date()
-                        logits = try self.model.step([best], state: self.convState)
+                        logits = try self.model.step([best], context: self.convState)
                         decodeSeconds += -t0.timeIntervalSinceNow
                         if terminated { cleanEnd = true; stopReason = "consumer-cancelled"; break }
                     }
