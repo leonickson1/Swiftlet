@@ -4,6 +4,10 @@ import Foundation
 public protocol InferenceModel: AnyObject {
     var config: QwenConfig { get }
     var modelDir: URL { get }
+    /// Effective capacity for one decode state. Fixed-size KV
+    /// implementations override this with the smaller of trained and actually
+    /// allocated capacity; dynamically growing runtimes use the trained cap.
+    var contextCapacity: Int { get }
     func step(_ tokens: [Int], state: QwenCPUModel.DecodeState) throws -> [Float]
     func step(
         _ tokens: [Int],
@@ -26,6 +30,10 @@ public extension InferenceModel {
         try checkGenerationCancellation(shouldCancel)
         return logits
     }
+}
+
+public extension InferenceModel {
+    var contextCapacity: Int { config.maxPositionEmbeddings }
 }
 
 extension QwenCPUModel: InferenceModel {
@@ -167,6 +175,12 @@ public final class TextGenerator: @unchecked Sendable {
         // shared model.
         try checkGenerationCancellation { cancellation.isCancelled }
 
+        let admittedMaxNew = try ContextWindow(maximumTokens: model.contextCapacity)
+            .admittedMaxNew(
+                processedTokens: 0,
+                incomingTokens: promptIds.count,
+                requestedMaxNew: maxNew
+            )
         var stats = Stats()
         stats.promptTokens = promptIds.count
         let state = QwenCPUModel.DecodeState()
@@ -180,7 +194,7 @@ public final class TextGenerator: @unchecked Sendable {
         stats.prefillSeconds = -prefillStart.timeIntervalSinceNow
 
         let decodeStart = Date()
-        for _ in 0..<max(0, maxNew) {
+        for _ in 0..<admittedMaxNew {
             try checkGenerationCancellation { cancellation.isCancelled }
             var best = 0
             for v in 1..<model.config.vocabSize where logits[v] > logits[best] { best = v }

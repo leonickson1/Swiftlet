@@ -959,6 +959,10 @@ public final class QwenMetalModel {
             )
         }
 
+        try ContextWindow(maximumTokens: config.maxPositionEmbeddings).validateStep(
+            processedTokens: state.position, incomingTokens: tokens.count
+        )
+
         var logits: [Float] = []
         // S1b: multi-token prompt calls take the layer-major chunked schedule
         // when enabled and the fast path plus chunk scratch are available;

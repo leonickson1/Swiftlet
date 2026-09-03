@@ -25,6 +25,7 @@ public struct QwenConfig: Sendable {
     public var ropeTheta: Double
     public var rmsNormEps: Double
     public var vocabSize: Int
+    public var maxPositionEmbeddings: Int
     public var tieWordEmbeddings: Bool
     public var fullAttentionInterval: Int
 
@@ -46,6 +47,7 @@ public struct QwenConfig: Sendable {
 
     public enum Error: Swift.Error {
         case missingField(String)
+        case invalidField(String)
     }
 
     public init(url: URL) throws {
@@ -74,6 +76,10 @@ public struct QwenConfig: Sendable {
         headDim = try int("head_dim")
         rmsNormEps = try dbl("rms_norm_eps", 1e-6)
         vocabSize = try int("vocab_size")
+        maxPositionEmbeddings = try int("max_position_embeddings")
+        guard maxPositionEmbeddings > 0 else {
+            throw Error.invalidField("max_position_embeddings must be positive")
+        }
         tieWordEmbeddings = (text["tie_word_embeddings"] as? Bool)
             ?? (top["tie_word_embeddings"] as? Bool) ?? false
         fullAttentionInterval = (text["full_attention_interval"] as? Int) ?? 4

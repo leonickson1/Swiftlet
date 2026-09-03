@@ -429,6 +429,9 @@ final class HTTPHandler: ChannelInboundHandler {
                         }
                     }
                 } catch {
+                    let message = (error as? LocalizedError)?.errorDescription
+                        ?? String(describing: error)
+                    let badRequest = error is ContextWindowError
                     eventLoop.execute {
                         guard channel.isActive else {
                             cancellation.cancel()
@@ -441,7 +444,7 @@ final class HTTPHandler: ChannelInboundHandler {
                             // second head would be a protocol error. Report
                             // the failure as an SSE event and end the stream.
                             let payload = "data: " + (String(
-                                data: jsonData(["error": "\(error)"]), encoding: .utf8
+                                data: jsonData(["error": message]), encoding: .utf8
                             ) ?? "{}") + "\n\ndata: [DONE]\n\n"
                             var buf = channel.allocator.buffer(capacity: payload.utf8.count)
                             buf.writeString(payload)
@@ -453,8 +456,11 @@ final class HTTPHandler: ChannelInboundHandler {
                                 terminal: true
                             )
                         } else {
-                            let data = jsonData(["error": "\(error)"])
-                            var head = HTTPResponseHead(version: .http1_1, status: .internalServerError)
+                            let data = jsonData(["error": message])
+                            let status: HTTPResponseStatus = badRequest
+                                ? .badRequest : .internalServerError
+                            var head = HTTPResponseHead(version: .http1_1, status: status)
+                            head.headers.add(name: "Content-Type", value: "application/json")
                             head.headers.add(name: "Content-Length", value: String(data.count))
                             var buf = channel.allocator.buffer(capacity: data.count)
                             buf.writeBytes(data)

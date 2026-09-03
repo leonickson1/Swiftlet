@@ -252,6 +252,9 @@ public final class QwenCPUModel {
         let cfg = config
         let S = tokens.count
         let D = cfg.hiddenSize
+        try ContextWindow(maximumTokens: cfg.maxPositionEmbeddings).validateStep(
+            processedTokens: state.position, incomingTokens: S
+        )
 
         var h = [Float](repeating: 0, count: S * D)
         for (s, t) in tokens.enumerated() {

@@ -31,6 +31,7 @@ import Testing
         "moe_intermediate_size": 32,
         "shared_expert_intermediate_size": 32,
         "vocab_size": 128,
+        "max_position_embeddings": 512,
         "full_attention_interval": 4,
         "rope_parameters": [
             "rope_type": "default",
@@ -55,6 +56,7 @@ import Testing
         #expect(config.deltaLayout == .split)
         #expect(config.ropeTheta == 10_000_000)
         #expect(config.partialRotaryFactor == 0.25)
+        #expect(config.maxPositionEmbeddings == 512)
     }
 
     /// qwen3_next's ModelArgs defaults norm_topk_prob to FALSE (the 80B
@@ -80,5 +82,15 @@ import Testing
             "text_config": text,
         ])
         #expect(!(try QwenConfig(url: url).normTopkProb))
+    }
+
+    @Test func rejectsNonpositiveContextWindow() throws {
+        var text = Self.textConfigCommon()
+        text["max_position_embeddings"] = 0
+        let url = try Self.write(text)
+
+        #expect(throws: QwenConfig.Error.self) {
+            _ = try QwenConfig(url: url)
+        }
     }
 }

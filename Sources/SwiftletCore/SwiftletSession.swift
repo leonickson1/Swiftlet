@@ -471,6 +471,23 @@ public final class SwiftletSession: @unchecked Sendable {
                         self.resetConversationState()
                         suffix = try self.freshPromptIds(messages)
                     }
+                    // Admission runs before any model call, so a rejection
+                    // leaves the cached conversation exactly as the client
+                    // last saw it. Keep it: a shorter retry can then continue
+                    // instead of re-prefilling the whole conversation.
+                    let admittedMaxNew: Int
+                    do {
+                        admittedMaxNew = try ContextWindow(
+                            maximumTokens: self.model.contextCapacity
+                        ).admittedMaxNew(
+                            processedTokens: self.convState.position,
+                            incomingTokens: suffix.count,
+                            requestedMaxNew: maxNew
+                        )
+                    } catch {
+                        terminalError = error
+                        return
+                    }
 
                     let start = Date()
                     var firstTokenAt: Date?
@@ -489,7 +506,7 @@ public final class SwiftletSession: @unchecked Sendable {
                         )
                         prefillDone = Date()
 
-                        for _ in 0..<max(0, maxNew) {
+                        for _ in 0..<admittedMaxNew {
                             try checkGenerationCancellation { control.isCancelled }
                             self.applyPendingShrink()
                             try checkGenerationCancellation { control.isCancelled }
