@@ -119,4 +119,89 @@ import Testing
         for i in 0..<a.count { maxDiff = max(maxDiff, abs(a[i] - b[i])) }
         #expect(maxDiff < 2e-3, "streamed container logits diff \(maxDiff)")
     }
+
+    // MARK: - Mixed-precision expert quantization (issue #30)
+
+    /// Copies the tiny 4-bit fixture and rewrites its quantization config to a
+    /// dense default with per-module `switch_mlp` overrides, reproducing the
+    /// mixed-precision shape (8-bit dense, 4-bit experts) of the DWQ variants.
+    /// The expert bytes stay 4-bit; only the recorded precision changes.
+    static func mixedPrecisionCheckpoint(defaultBits: Int, expertBits: [String: Int],
+                                         group: Int = 32) throws -> URL {
+        let src = Self.fixturesDir.appendingPathComponent("tiny-model-q4")
+        let dst = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tiny-mixed-\(UUID().uuidString)")
+        try FileManager.default.copyItem(at: src, to: dst)
+        let cfgURL = dst.appendingPathComponent("config.json")
+        var cfg = try JSONSerialization.jsonObject(with: Data(contentsOf: cfgURL)) as! [String: Any]
+        var quant: [String: Any] = ["group_size": group, "bits": defaultBits]
+        for (module, bits) in expertBits {
+            quant[module] = ["group_size": group, "bits": bits]
+        }
+        cfg["quantization"] = quant
+        try JSONSerialization.data(withJSONObject: cfg).write(to: cfgURL)
+        return dst
+    }
+
+    /// A checkpoint whose experts are 4-bit under an 8-bit dense default must
+    /// repack a manifest that records 4-bit, not the 8-bit default. Recording
+    /// the default made the runtime dequantize the 4-bit expert payload as
+    /// 8-bit and decode garbage with no error (issue #30).
+    @Test func repackRecordsExpertQuantNotCheckpointDefault() throws {
+        let src = try Self.mixedPrecisionCheckpoint(defaultBits: 8, expertBits: [
+            "model.layers.0.mlp.switch_mlp.gate_proj": 4,
+            "model.layers.0.mlp.switch_mlp.up_proj": 4,
+            "model.layers.0.mlp.switch_mlp.down_proj": 4,
+        ])
+        let out = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mixed-\(UUID().uuidString).qpack")
+        defer {
+            try? FileManager.default.removeItem(at: src)
+            try? FileManager.default.removeItem(at: out)
+        }
+        var repacker = QpackRepacker(checkpointDir: src, outputDir: out)
+        repacker.log = { _ in }
+        try repacker.repack()
+
+        let manifest = try JSONDecoder().decode(
+            Qpack.Manifest.self,
+            from: Data(contentsOf: out.appendingPathComponent("manifest.json")))
+        #expect(manifest.quantBits == 4, "manifest must record the 4-bit expert precision, not the 8-bit default")
+        #expect(manifest.quantGroupSize == 32)
+    }
+
+    /// When the expert projections carry different precisions, no single
+    /// manifest value is correct, so repack must refuse rather than ship a
+    /// container that decodes garbage for some projections (issue #30).
+    @Test func repackRejectsDisagreeingExpertQuant() throws {
+        let src = try Self.mixedPrecisionCheckpoint(defaultBits: 8, expertBits: [
+            "model.layers.0.mlp.switch_mlp.gate_proj": 4,
+            "model.layers.0.mlp.switch_mlp.up_proj": 8,
+            "model.layers.0.mlp.switch_mlp.down_proj": 4,
+        ])
+        let out = FileManager.default.temporaryDirectory
+            .appendingPathComponent("mixed-bad-\(UUID().uuidString).qpack")
+        defer {
+            try? FileManager.default.removeItem(at: src)
+            try? FileManager.default.removeItem(at: out)
+        }
+        var repacker = QpackRepacker(checkpointDir: src, outputDir: out)
+        repacker.log = { _ in }
+        #expect(throws: QpackRepacker.Error.self) { try repacker.repack() }
+    }
+
+    /// The load-time guard rejects a container whose manifest quantization does
+    /// not match its packed expert shapes (issue #30). For the tiny geometry
+    /// (hidden 64, group 32) a 4-bit weight stores 8 words per row and its
+    /// scales store 2 groups per row; reading those bytes as 8-bit makes the
+    /// two disagree.
+    @Test func expertLogicalInDimRejectsQuantMismatch() throws {
+        let inDim = try Qpack.expertLogicalInDim(
+            weightLastDim: 8, scalesLastDim: 2, bits: 4, groupSize: 32, section: "gate_proj.weight")
+        #expect(inDim == 64)
+        #expect(throws: (any Swift.Error).self) {
+            _ = try Qpack.expertLogicalInDim(
+                weightLastDim: 8, scalesLastDim: 2, bits: 8, groupSize: 32, section: "gate_proj.weight")
+        }
+    }
 }

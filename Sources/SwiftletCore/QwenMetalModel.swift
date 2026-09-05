@@ -398,9 +398,12 @@ public final class QwenMetalModel {
                 if w.dtype == "U32", let bits = manifest.quantBits, let group = manifest.quantGroupSize,
                    let sSec = cache.reader.section(name + ".scales"),
                    let bSec = cache.reader.section(name + ".biases") {
+                    let inDim = try Qpack.expertLogicalInDim(
+                        weightLastDim: w.shape.last ?? 0, scalesLastDim: sSec.shape.last ?? 0,
+                        bits: bits, groupSize: group, section: name)
                     return ExpertProj(
                         wOff: w.offset, sOff: sSec.offset, bOff: bSec.offset,
-                        outDim: outDim, inDim: w.shape.last! * (32 / bits),
+                        outDim: outDim, inDim: inDim,
                         groupSize: group, bits: bits,
                         scalesType: MetalEngine.ScalesType(dtype: sSec.dtype)?.rawValue ?? 2,
                         isQuantized: true, plainDtype: 0
