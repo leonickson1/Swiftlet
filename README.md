@@ -27,10 +27,13 @@ demand. The result:
 Those figures are on an M5. For a low end anchor, a base M1 (8-core GPU, 16 GB)
 decodes the 4-bit 35B at about 2.45 tok/s and the 8-bit at about 1.74 tok/s, and
 prefill runs at roughly decode speed, so a long system prompt is expensive on
-this class of machine. On so few GPU cores the decode loop is fully compute
-bound, so the expert cache is a memory knob rather than a speed one there:
-`--cache-gb 2` matches `--cache-gb 8` while saving several GB of RAM, which is
-the better setting on a 16 GB machine.
+this class of machine. On so few GPU cores the decode loop is close to compute
+bound, so the expert cache is mostly a memory knob there: on a short prompt
+`--cache-gb 2` matches `--cache-gb 8` while saving several GB of RAM. Long
+context is the exception, since that is where cold expert reads cluster: on a
+503-token prompt a larger cache lifts decode about 8 percent from 2 to 6 GB by
+trimming the CPU gap between command buffers. On a 16 GB machine the low setting
+is still usually the right trade.
 
 At the other end, an M4 Max (40-core GPU, 64 GB) decodes the 4-bit 35B at about
 19.5 tok/s. The configuration that shows why streaming matters is the 8-bit 80B:
@@ -131,8 +134,10 @@ routes every token to 10 of 512 experts (80B) or 8 of 256 (35B). Swiftlet:
   a `.qpack` container, so fetching one expert is exactly one `pread` from
   SSD, no mmap and no page-cache thrash;
 - caches hot experts in a bounded pool with LFU plus recency eviction. Cache
-  size barely affects speed (measured 43 to 70 percent hit rates at the same
-  throughput), because Apple SSDs absorb the misses;
+  size is more a cold-start and memory knob than a throughput one (measured 43
+  to 70 percent hit rates at nearly the same throughput), because Apple SSDs
+  absorb the misses, though a larger cache does help long-context decode where
+  cold reads cluster;
 - runs the whole forward pass on Metal with runtime-compiled shaders, so no
   Metal toolchain is needed at build time and the same code ships on iOS.
 

@@ -46,6 +46,32 @@ public enum Qpack {
     }
 
     static func align(_ n: Int, to a: Int) -> Int { (n + a - 1) / a * a }
+
+    /// Logical inner dimension of a quantized expert projection, cross-checked
+    /// against the manifest's quantization. A quantized weight stores
+    /// `inDim / (32 / bits)` uint32 words per row; its scales store
+    /// `inDim / groupSize` groups per row. Both describe the same `inDim`, so
+    /// when the manifest's bits/groupSize make them disagree the container's
+    /// recorded quantization does not match its packed bytes, and dequantizing
+    /// anyway would decode garbage. This catches an already-built bad container
+    /// at load with a clear error instead of silent garbage (issue #30).
+    static func expertLogicalInDim(weightLastDim: Int, scalesLastDim: Int,
+                                   bits: Int, groupSize: Int,
+                                   section: String) throws -> Int {
+        guard bits > 0, groupSize > 0, 32 % bits == 0 else {
+            throw Checkpoint.Error.badShape(
+                "qpack section \(section): invalid quantization \(bits)-bit/g\(groupSize)")
+        }
+        let fromWeight = weightLastDim * (32 / bits)
+        let fromScales = scalesLastDim * groupSize
+        guard fromWeight > 0, fromWeight == fromScales else {
+            throw Checkpoint.Error.badShape(
+                "qpack section \(section): manifest \(bits)-bit/g\(groupSize) disagrees with the packed "
+                + "shapes (weight inner \(weightLastDim), scales inner \(scalesLastDim)); the container's "
+                + "recorded quantization does not match its expert bytes (issue #30)")
+        }
+        return fromWeight
+    }
 }
 
 /// Repacks a local mlx-lm checkpoint directory into a `.qpack` container.
@@ -59,7 +85,46 @@ public struct QpackRepacker {
         self.outputDir = outputDir
     }
 
+    public enum Error: Swift.Error, CustomStringConvertible {
+        /// The packed expert projections do not share one quantization, which a
+        /// single-valued manifest cannot represent (issue #30).
+        case mixedExpertQuant(String)
+        public var description: String {
+            switch self { case .mixedExpertQuant(let m): return m }
+        }
+    }
+
     static let expertTensorSuffixes = ["gate_proj", "up_proj", "down_proj"]
+
+    /// The quantization the packed EXPERT tensors were stored with, which is
+    /// what the runtime must dequantize them by, resolved from the checkpoint's
+    /// per-tensor overrides and falling back to its default. This is not always
+    /// the checkpoint's top-level default: a mixed-precision checkpoint (for
+    /// example an 8-bit dense default with 4-bit `switch_mlp` experts, as in the
+    /// DWQ variants) carries the expert precision as per-tensor overrides.
+    /// Returns nil for an unquantized checkpoint. Throws when the expert
+    /// projections disagree with each other, since the manifest records one
+    /// value for all of them (issue #30).
+    static func expertQuant(_ ckpt: Checkpoint) throws -> Checkpoint.QuantSpec? {
+        var resolved: [(module: String, spec: Checkpoint.QuantSpec)] = []
+        for proj in expertTensorSuffixes {
+            // Layer 0 is representative: the section table is derived from it,
+            // and mlx-lm quantizes a given module identically across layers.
+            let module = "model.layers.0.mlp.switch_mlp." + proj
+            guard ckpt.contains(module + ".weight") else { continue }
+            guard let spec = ckpt.quantSpec(for: module) else { continue }
+            resolved.append((module, spec))
+        }
+        guard let first = resolved.first else { return ckpt.defaultQuant }
+        for entry in resolved
+        where entry.spec.bits != first.spec.bits || entry.spec.groupSize != first.spec.groupSize {
+            throw Error.mixedExpertQuant(
+                "expert projection \(entry.module) is \(entry.spec.bits)-bit/g\(entry.spec.groupSize) "
+                + "but \(first.module) is \(first.spec.bits)-bit/g\(first.spec.groupSize); a container "
+                + "records one expert quantization and cannot represent both")
+        }
+        return first.spec
+    }
 
     /// Follows a (possibly relative, possibly chained) symlink to the real file
     /// it points at, returning the input unchanged when it is not a symlink.
@@ -85,6 +150,12 @@ public struct QpackRepacker {
         let fm = FileManager.default
         let config = try QwenConfig(url: checkpointDir.appendingPathComponent("config.json"))
         let ckpt = try Checkpoint(dir: checkpointDir)
+
+        // Resolve (and validate) the expert quantization up front so a
+        // mixed-precision checkpoint fails before packing gigabytes rather than
+        // after, and so the manifest records the experts' real precision instead
+        // of the checkpoint's dense default (issue #30).
+        let expertQuant = try Self.expertQuant(ckpt)
 
         let expertsDir = outputDir.appendingPathComponent("packed_experts")
         try fm.createDirectory(at: expertsDir, withIntermediateDirectories: true)
@@ -188,13 +259,15 @@ public struct QpackRepacker {
             files[aux] = try fm.attributesOfItem(atPath: dst.path)[.size] as? Int ?? 0
         }
 
+        // quantBits/quantGroupSize describe the packed EXPERT tensors (resolved
+        // and validated above), not the checkpoint's dense default (issue #30).
         let manifest = Qpack.Manifest(
             magic: "QPACK",
             version: Qpack.manifestVersion,
             modelName: config.modelType,
             sourceCheckpoint: checkpointDir.lastPathComponent,
-            quantBits: ckpt.defaultQuant?.bits,
-            quantGroupSize: ckpt.defaultQuant?.groupSize,
+            quantBits: expertQuant?.bits,
+            quantGroupSize: expertQuant?.groupSize,
             files: files
         )
         try JSONEncoder.sorted.encode(manifest).write(to: outputDir.appendingPathComponent("manifest.json"))
