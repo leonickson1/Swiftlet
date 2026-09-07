@@ -52,6 +52,21 @@ struct ChatRequest: Decodable {
     let temperature: Float?
     let top_p: Float?
     let stop: StopSequences?
+    // Repetition controls. `presence_penalty` and `frequency_penalty` are
+    // standard OpenAI request fields; `no_repeat_ngram` and `min_tokens` expose
+    // the two remaining knobs that have no OpenAI equivalent.
+    //
+    // These exist for structured output. The defaults are tuned for prose on a
+    // quantized checkpoint (issue #13), and JSON is the case they penalise: its
+    // structural trigrams (`",\n  "`, `": "`) recur on every key, so
+    // noRepeatNGram bans the opening quote of the second key outright, and
+    // minNew forces generation past a complete short object. Callers that want
+    // machine-readable output need to turn them down; callers that want prose
+    // keep today's behaviour by not sending them.
+    let presence_penalty: Float?
+    let frequency_penalty: Float?
+    let no_repeat_ngram: Int?
+    let min_tokens: Int?
 }
 
 let cliArgs = CommandLine.arguments
@@ -305,6 +320,10 @@ final class HTTPHandler: ChannelInboundHandler {
                 if t <= 0 { o = .greedy } else { o.temperature = t }
             }
             if let p = request.top_p { o.topP = p }
+            if let p = request.presence_penalty { o.presencePenalty = p }
+            if let p = request.frequency_penalty { o.frequencyPenalty = p }
+            if let n = request.no_repeat_ngram { o.noRepeatNGram = max(0, n) }
+            if let m = request.min_tokens { o.minNew = max(0, m) }
             o.stopSequences = request.stop?.values ?? []
             return o
         }()
