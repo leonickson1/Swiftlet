@@ -141,7 +141,20 @@ public final class StreamingInstaller {
 
     public func install() throws {
         let fm = FileManager.default
+        // A directory that already holds a checkpoint is refused by name; the
+        // only thing this installer writes into is an empty directory or an
+        // interrupted install of its own, which the sidecar identifies.
+        try Qpack.checkOutputDirectory(outputDir, resumable: true)
         try fm.createDirectory(at: outputDir.appendingPathComponent("packed_experts"), withIntermediateDirectories: true)
+        // The sidecar goes down first and comes up last: from here until the
+        // manifest is written the directory is an install in progress, and a
+        // re-run resumes through it (per-shard byte cursors on the repacking
+        // path, per-file sizes on the direct-download path). A re-run must
+        // not reset the cursors already recorded.
+        let progressURL = outputDir.appendingPathComponent(Qpack.installProgressSidecar)
+        if !fm.fileExists(atPath: progressURL.path) {
+            try Data("{}".utf8).write(to: progressURL)
+        }
 
         // Already-packed container repo (our published .qpack repos): download
         // the files directly instead of repacking. Detected by manifest.json.
@@ -177,6 +190,7 @@ public final class StreamingInstaller {
             }
             // Manifest last: its presence marks the container complete.
             try mData.write(to: outputDir.appendingPathComponent("manifest.json"))
+            try? fm.removeItem(at: progressURL)
             log("container complete at \(outputDir.path)")
             return
         }
@@ -356,7 +370,6 @@ public final class StreamingInstaller {
         }
 
         // 6. Stream shards, routing bytes; resume via sidecar.
-        let progressURL = outputDir.appendingPathComponent(".install-progress.json")
         var progress: [String: Int] = (try? JSONSerialization.jsonObject(
             with: Data(contentsOf: progressURL))) as? [String: Int] ?? [:]
 

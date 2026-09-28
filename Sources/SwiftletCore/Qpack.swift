@@ -58,11 +58,23 @@ public enum Qpack {
         /// `layout.json` promises `layerCount` blob files of
         /// `expertStride × expertCount` bytes; one disagrees.
         case layoutMismatch(String)
+        /// The output directory already holds a checkpoint or a container;
+        /// `file` is what says so. Neither producer writes over it.
+        case occupiedOutput(dir: String, file: String)
+        /// The output directory holds a streaming install that was
+        /// interrupted (its progress sidecar is still there). Only the
+        /// streaming installer can resume it; the repacker refuses.
+        case interruptedInstall(String)
 
         public var description: String {
             switch self {
             case .notAContainer(let dir):
                 return "\(dir) is not a qpack container (no manifest.json; an interrupted install looks the same way -- re-run it to resume)"
+            case .occupiedOutput(let dir, let file):
+                return "\(dir) already holds a checkpoint (\(file)); choose an empty output directory or remove it first"
+            case .interruptedInstall(let dir):
+                return "\(dir) holds an interrupted streaming install (\(Qpack.installProgressSidecar)); "
+                    + "re-run the same install to resume it, or remove the directory before repacking into it"
             case .missingFile(let path):
                 return "qpack container is missing \(path), which its manifest lists"
             case .sizeMismatch(let path, let expected, let actual):
@@ -71,6 +83,50 @@ public enum Qpack {
             case .layoutMismatch(let why):
                 return "qpack container disagrees with its own packed_experts/layout.json: \(why)"
             }
+        }
+    }
+
+    /// The streaming installer's progress sidecar. It is the first thing an
+    /// install writes into its output directory and the last thing it
+    /// removes, so its presence is what distinguishes an interrupted install
+    /// of our own (resumable) from a checkpoint someone else put there.
+    public static let installProgressSidecar = ".install-progress.json"
+
+    /// Refuses `dir` as an output directory when it already holds a
+    /// checkpoint or a container, naming the file that says so; an absent or
+    /// empty directory, or one holding only aux files, is accepted. A
+    /// finished container (`manifest.json`) or a sharded checkpoint's index
+    /// is refused outright. A directory still carrying the install sidecar
+    /// is an interrupted streaming install: `resumable` callers (the
+    /// installer) proceed into it, others (the repacker) refuse it by name.
+    /// Without the sidecar, any shard, expert layout or expert blob means
+    /// the directory is someone's checkpoint, not an install of ours.
+    public static func checkOutputDirectory(_ dir: URL, resumable: Bool) throws {
+        let fm = FileManager.default
+        // Absent (or unreadable): nothing to protect; the producer's own
+        // createDirectory reports the latter.
+        guard let names = try? fm.contentsOfDirectory(atPath: dir.path) else { return }
+        let sorted = names.sorted()
+        if sorted.contains("manifest.json") {
+            throw Error.occupiedOutput(dir: dir.path, file: "manifest.json")
+        }
+        if let index = sorted.first(where: { $0.hasSuffix(".safetensors.index.json") }) {
+            throw Error.occupiedOutput(dir: dir.path, file: index)
+        }
+        if sorted.contains(installProgressSidecar) {
+            if resumable { return }
+            throw Error.interruptedInstall(dir.path)
+        }
+        if let shard = sorted.first(where: { $0.hasSuffix(".safetensors") }) {
+            throw Error.occupiedOutput(dir: dir.path, file: shard)
+        }
+        let expertsDir = dir.appendingPathComponent("packed_experts")
+        if fm.fileExists(atPath: expertsDir.appendingPathComponent("layout.json").path) {
+            throw Error.occupiedOutput(dir: dir.path, file: "packed_experts/layout.json")
+        }
+        if let blobs = try? fm.contentsOfDirectory(atPath: expertsDir.path),
+           let blob = blobs.sorted().first(where: { $0.hasPrefix("layer_") && $0.hasSuffix(".bin") }) {
+            throw Error.occupiedOutput(dir: dir.path, file: "packed_experts/" + blob)
         }
     }
 
@@ -250,6 +306,11 @@ public struct QpackRepacker {
         // of the checkpoint's dense default (issue #30).
         let expertQuant = try Self.expertQuant(ckpt)
 
+        // The output directory is claimed only when it holds no checkpoint:
+        // a raw checkpoint there would have its shard truncated to the dense
+        // file, a finished container its manifest overwritten. The repacker
+        // has no resume, so an interrupted streaming install is refused too.
+        try Qpack.checkOutputDirectory(outputDir, resumable: false)
         let expertsDir = outputDir.appendingPathComponent("packed_experts")
         try fm.createDirectory(at: expertsDir, withIntermediateDirectories: true)
 
