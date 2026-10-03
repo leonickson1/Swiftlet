@@ -60,9 +60,18 @@ public final class ExpertCache {
     private var maxSlots: Int
     private var physicalBudget: ExpertCacheBudget
 
-    init(containerDir: URL, device: MTLDevice, budgetBytes: Int) throws {
+    convenience init(containerDir: URL, device: MTLDevice, budgetBytes: Int) throws {
+        try self.init(
+            reader: try QpackExpertReader(containerDir: containerDir),
+            device: device, budgetBytes: budgetBytes)
+    }
+
+    /// Builds the cache over a reader that is already open, so the model can
+    /// price the container (and its own resident weights) before choosing
+    /// the budget without verifying the container twice.
+    init(reader: QpackExpertReader, device: MTLDevice, budgetBytes: Int) throws {
         self.device = device
-        reader = try QpackExpertReader(containerDir: containerDir)
+        self.reader = reader
         stride = reader.layout.expertStride
         guard stride > 0, !reader.layout.sections.isEmpty else {
             throw Checkpoint.Error.badShape("corrupt container: empty expert layout (re-download the model)")

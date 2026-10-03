@@ -248,6 +248,11 @@ public final class QwenMetalModel {
     var lmHead: GPULinear
     public internal(set) var expertCache: ExpertCache?
     var expertProjs: (gate: ExpertProj, up: ExpertProj, down: ExpertProj)?
+    /// How the expert-cache budget was derived for this host and container;
+    /// nil for a raw checkpoint, which streams no experts.
+    public private(set) var cacheBudgetDerivation: ExpertCacheBudgetDerivation?
+    /// The `--cache-gb` the caller passed, nil when the default was derived.
+    public private(set) var requestedCacheBudgetGB: Double?
     let xBuf: MTLBuffer
     let yBuf: MTLBuffer
     let logitsBuf: MTLBuffer
@@ -356,7 +361,11 @@ public final class QwenMetalModel {
     var prefillSlotCapacity = 0
     var prefillStage = PrefillStage()
 
-    public init(modelDir: URL, cacheBudgetGB: Double = 8) throws {
+    /// `cacheBudgetGB` is a ceiling on the expert cache of a .qpack container;
+    /// nil derives the budget from this host (see
+    /// ``ExpertCacheBudgetDerivation``), and a value the host cannot hold
+    /// beside the model is refused here, naming both numbers.
+    public init(modelDir: URL, cacheBudgetGB: Double? = nil) throws {
         config = try QwenConfig(url: modelDir.appendingPathComponent("config.json"))
         ckpt = try Checkpoint(dir: modelDir)
         engine = try MetalEngine()
@@ -373,6 +382,11 @@ public final class QwenMetalModel {
         let qpackMode = FileManager.default.fileExists(
             atPath: modelDir.appendingPathComponent("packed_experts/layout.json").path
         )
+        // Sampled before any dense weight is copied resident, so the budget
+        // formula's resident term is not also subtracted from what the host
+        // reports as available.
+        let host = qpackMode ? ExpertCacheBudgetDerivation.Host.sample(device: engine.device) : nil
+        var qpackReader: QpackExpertReader?
         func denseLinear(_ path: String) throws -> GPULinear {
             qpackMode
                 ? try store.residentLinear(ckpt: ckpt, path: path)
@@ -383,11 +397,11 @@ public final class QwenMetalModel {
         lmHead = try denseLinear(cfg.tieWordEmbeddings ? "model.embed_tokens" : "lm_head")
 
         if qpackMode {
-            let cache = try ExpertCache(
-                containerDir: modelDir, device: engine.device,
-                budgetBytes: Int(cacheBudgetGB * 1_073_741_824)
-            )
-            expertCache = cache
+            // The cache itself is built last, once every resident dense
+            // linear has been priced; the reader is what the projections
+            // need now.
+            let reader = try QpackExpertReader(containerDir: modelDir)
+            qpackReader = reader
 
             let manifestURL = modelDir.appendingPathComponent("manifest.json")
             guard FileManager.default.fileExists(atPath: manifestURL.path) else {
@@ -395,12 +409,12 @@ public final class QwenMetalModel {
             }
             let manifest = try JSONDecoder().decode(Qpack.Manifest.self, from: Data(contentsOf: manifestURL))
             func proj(_ name: String, outDim: Int) throws -> ExpertProj {
-                guard let w = cache.reader.section(name + ".weight") else {
+                guard let w = reader.section(name + ".weight") else {
                     throw Checkpoint.Error.missingTensor("qpack section \(name)")
                 }
                 if w.dtype == "U32", let bits = manifest.quantBits, let group = manifest.quantGroupSize,
-                   let sSec = cache.reader.section(name + ".scales"),
-                   let bSec = cache.reader.section(name + ".biases") {
+                   let sSec = reader.section(name + ".scales"),
+                   let bSec = reader.section(name + ".biases") {
                     let inDim = try Qpack.expertLogicalInDim(
                         weightLastDim: w.shape.last ?? 0, scalesLastDim: sSec.shape.last ?? 0,
                         bits: bits, groupSize: group, section: name)
@@ -518,6 +532,45 @@ public final class QwenMetalModel {
         print("[QwenMetalModel] descriptors ready; building fast path...")
         try setupFastPath(denseLinear: denseLinear)
         print("[QwenMetalModel] fast path ready")
+
+        if let reader = qpackReader, let host {
+            // Every resident dense linear is allocated by now (the fast path
+            // copies the last ones), so the trunk is priced from what was
+            // actually placed, not from a per-model constant.
+            let derivation = try ExpertCacheBudgetDerivation(
+                host: host, model: Self.budgetModel(config: cfg, store: store, layout: reader.layout))
+            let budgetBytes = try derivation.admit(requestedGB: cacheBudgetGB)
+            cacheBudgetDerivation = derivation
+            requestedCacheBudgetGB = cacheBudgetGB
+            print("[QwenMetalModel] " + derivation.summary(budgetBytes: budgetBytes, requestedGB: cacheBudgetGB))
+            expertCache = try ExpertCache(reader: reader, device: engine.device, budgetBytes: budgetBytes)
+        }
+    }
+
+    /// What this model keeps beside the expert cache, for the budget formula:
+    /// the resident dense bytes the store placed, KV as `ensureKVCapacity`
+    /// allocates it (f32 K and V on every full-attention layer), and the
+    /// DeltaNet state and convolution history `setupFastPath` allocates.
+    static func budgetModel(
+        config cfg: QwenConfig, store: MetalShardStore, layout: Qpack.Layout
+    ) -> ExpertCacheBudgetDerivation.Model {
+        var fullAttentionLayers = 0
+        var linearLayers = 0
+        for i in 0..<cfg.numHiddenLayers {
+            if cfg.isLinearLayer(i) { linearLayers += 1 } else { fullAttentionLayers += 1 }
+        }
+        let kvRowBytes = cfg.numKeyValueHeads * cfg.headDim * 4
+        let deltaState = cfg.linearNumValueHeads * cfg.linearValueHeadDim * cfg.linearKeyHeadDim * 4
+        let convHistory = max(0, cfg.linearConvKernelDim - 1) * cfg.convDim * 4
+        return ExpertCacheBudgetDerivation.Model(
+            residentDenseBytes: store.residentBytes,
+            kvBytesPerToken: fullAttentionLayers * 2 * kvRowBytes,
+            contextCapacity: cfg.maxPositionEmbeddings,
+            fixedStateBytes: linearLayers * (deltaState + convHistory),
+            expertStride: layout.expertStride,
+            expertSlots: layout.expertCount * layout.layerCount,
+            expertFetchesPerToken: cfg.numHiddenLayers * cfg.numExpertsPerTok
+        )
     }
 
     private func setupFastPath(denseLinear: (String) throws -> GPULinear) throws {
@@ -587,9 +640,11 @@ public final class QwenMetalModel {
         }
     }
 
-    /// Replaces the expert cache with a smaller one (old slots free
-    /// immediately; the new cache refills lazily). Memory-pressure valve.
-    public func shrinkCache(toGB gb: Double) {
+    /// Replaces the expert cache with one bounded by `gb` (old slots free
+    /// immediately; the new cache refills lazily). The memory-pressure valve
+    /// in both directions: the session shrinks here on a warning and restores
+    /// the configured budget here when pressure lifts.
+    public func resizeCache(toGB gb: Double) {
         guard expertCache != nil else { return }
         // Int(Double) traps on NaN, infinity, and out-of-range values; a
         // pressure valve must refuse such a request, not crash on it.
@@ -599,6 +654,12 @@ public final class QwenMetalModel {
             containerDir: ckpt.dir, device: engine.device, budgetBytes: budget
         ) else { return }
         expertCache = replacement
+    }
+
+    /// The original name of `resizeCache(toGB:)`, kept for callers that only
+    /// ever shrank.
+    public func shrinkCache(toGB gb: Double) {
+        resizeCache(toGB: gb)
     }
 
     // MARK: - GPU phase helper

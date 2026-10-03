@@ -8,7 +8,7 @@ import SwiftletCore
 // TurboFieldfare's). One warm model, requests serialized. No auth/TLS: keep it
 // on 127.0.0.1.
 //
-//   swiftlet-server --model <dir> [--port 8080] [--cache-gb 2]
+//   swiftlet-server --model <dir> [--port 8080] [--cache-gb N]
 
 /// Message content per the OpenAI Chat Completions spec: a plain string, an
 /// array of parts ([{type:"text",text:"..."}]), or null on tool-call turns.
@@ -105,11 +105,19 @@ func flag(_ name: String) -> String? {
     return cliArgs[i + 1]
 }
 guard let modelPath = flag("--model") else {
-    print("usage: swiftlet-server --model <dir> [--port 8080] [--cache-gb 2]")
+    print("usage: swiftlet-server --model <dir> [--port 8080] [--cache-gb N]")
     exit(2)
 }
 let port = Int(flag("--port") ?? "8080") ?? 8080
-let cacheGB = Double(flag("--cache-gb") ?? "2") ?? 2
+// --cache-gb is a ceiling on the expert cache; absent, the budget is derived
+// from this host. A value that is not a number is refused, not replaced.
+let cacheGB: Double? = try {
+    guard let raw = flag("--cache-gb") else { return nil }
+    guard let gb = Double(raw), gb.isFinite, gb >= 0 else {
+        throw ExpertCacheBudgetDerivation.Error.invalidBudget(raw)
+    }
+    return gb
+}()
 let modelURL = URL(fileURLWithPath: modelPath)
 
 FileHandle.standardError.write(Data("loading model + tokenizer...\n".utf8))
@@ -118,6 +126,14 @@ FileHandle.standardError.write(Data("loading model + tokenizer...\n".utf8))
 // (The CPU model reader cannot serve containers: their experts are not in
 // model.safetensors.)
 let session = try await SwiftletSession(modelDir: modelURL, cacheBudgetGB: cacheGB)
+// OS memory pressure: warning/critical shrink the expert cache to the valve,
+// normal restores --cache-gb. The monitor must outlive every request, so it
+// is a top-level global like the session.
+let memoryPressureMonitor = session.makeMemoryPressureMonitor()
+FileHandle.standardError.write(Data(String(
+    format: "memory-pressure source registered (warning/critical shrink the expert cache to %.2f GB, normal restores %.2f GB)\n",
+    min(SwiftletSession.pressureShrinkGB, session.cacheBudgetGB), session.cacheBudgetGB
+).utf8))
 let modelName: String = {
     let configURL = modelURL.appendingPathComponent("config.json")
     if let cfg = try? JSONSerialization.jsonObject(with: Data(contentsOf: configURL)) as? [String: Any],

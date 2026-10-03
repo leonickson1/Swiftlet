@@ -233,8 +233,9 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
     let model: any InferenceModel
     if CommandLine.arguments.contains("--gpu") {
         // Metal runtime: weights stay quantized; experts stream via the
-        // bounded cache (--cache-gb) when the model is a .qpack container.
-        let cacheGB = Double(flagValue(CommandLine.arguments, "--cache-gb") ?? "8") ?? 8
+        // bounded cache when the model is a .qpack container. --cache-gb is
+        // a ceiling; absent, the budget is derived from this host.
+        let cacheGB = try parseCacheGB(flagValue(CommandLine.arguments, "--cache-gb"))
         let metal = try QwenMetalModel(modelDir: url, cacheBudgetGB: cacheGB)
         // S1b prefill schedule knob: --prefill-chunk N sets the layer-major
         // chunk size; 0 restores the legacy token-major schedule (A/B runs).
@@ -396,7 +397,7 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
 
 /// Multi-turn chat through SwiftletSession — the exact code path the app
 /// uses (template + no-think prompt, conversation cache, sampling).
-func runChat(modelDir: String, turns: [String], maxNew: Int, cacheGB: Double, greedy: Bool, system: String?) async throws {
+func runChat(modelDir: String, turns: [String], maxNew: Int, cacheGB: Double?, greedy: Bool, system: String?) async throws {
     let session = try await SwiftletSession(
         modelDir: URL(fileURLWithPath: modelDir), cacheBudgetGB: cacheGB)
     var messages: [[String: String]] = []
@@ -420,6 +421,17 @@ func runChat(modelDir: String, turns: [String], maxNew: Int, cacheGB: Double, gr
         ).utf8))
         messages.append(["role": "assistant", "content": reply])
     }
+}
+
+/// `--cache-gb` as a ceiling: absent means derive from the host; a value
+/// that is not a finite, non-negative number is refused by name rather than
+/// silently replaced.
+func parseCacheGB(_ raw: String?) throws -> Double? {
+    guard let raw else { return nil }
+    guard let gb = Double(raw), gb.isFinite, gb >= 0 else {
+        throw ExpertCacheBudgetDerivation.Error.invalidBudget(raw)
+    }
+    return gb
 }
 
 func flagValue(_ args: [String], _ name: String) -> String? {
@@ -488,7 +500,7 @@ case "chat" where args.count >= 3:
             modelDir: args[2],
             turns: turns.isEmpty ? ["What is the capital of Spain?"] : turns,
             maxNew: Int(flagValue(args, "--max-new") ?? "256") ?? 256,
-            cacheGB: Double(flagValue(args, "--cache-gb") ?? "8") ?? 8,
+            cacheGB: try parseCacheGB(flagValue(args, "--cache-gb")),
             greedy: args.contains("--greedy"),
             system: flagValue(args, "--system")
         )
@@ -501,10 +513,11 @@ default:
     print("  swiftlet info <model>            model budget summary (\(ArchConfig.known.keys.sorted().joined(separator: " | ")))")
     print("  swiftlet verify <model-dir> <fixtures.safetensors>   compare CPU forward vs mlx fixture")
     print("  swiftlet dump-tensor <model-dir> <module-path> <out.safetensors>   dequantized f32 weights of one module")
-    print("  swiftlet generate <model-dir> --prompt \"...\" [--max-new 32] [--chat] [--gpu] [--cache-gb 8] [--prefill-chunk 32] [--lazy]")
-    print("  swiftlet chat <model-dir> [\"turn\" ...] [--max-new 256] [--cache-gb 8] [--greedy] [--system \"...\"]")
+    print("  swiftlet generate <model-dir> --prompt \"...\" [--max-new 32] [--chat] [--gpu] [--cache-gb N] [--prefill-chunk 32] [--lazy]")
+    print("  swiftlet chat <model-dir> [\"turn\" ...] [--max-new 256] [--cache-gb N] [--greedy] [--system \"...\"]")
     print("")
     print("  --gpu       Metal runtime; on a .qpack container experts stream through a bounded cache")
-    print("  --cache-gb  expert cache budget, default 8 (note: swiftlet-server defaults to 2)")
+    print("  --cache-gb  ceiling on the expert cache budget; absent, the budget is derived from this host")
+    print("              (working set - resident dense weights - KV at full context - margin, clamped to the expert pool)")
     print("  --lazy      CPU path only: ~3 GB peak instead of ~10-14 GB, slower per step")
 }
