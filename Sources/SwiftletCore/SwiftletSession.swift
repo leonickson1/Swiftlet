@@ -11,6 +11,23 @@ public final class SwiftletSession: @unchecked Sendable {
         public var timeToFirstToken: TimeInterval = 0
         public var tokensPerSecond: Double = 0
         public var finishReason: GenerationFinishReason?
+        /// Whether the cached conversation state served this request's
+        /// prompt, and why or why not.
+        public var prefixReuse = PrefixReuse()
+    }
+
+    /// The prefix-reuse decision for one request, kept in `Metrics` so a
+    /// caller (or a contract test) can read it without parsing the log line.
+    public struct PrefixReuse: Sendable, Equatable {
+        /// Prompt tokens the cached state already covered. 0 means the whole
+        /// prompt was prefilled, and `reason` says why.
+        public var reusedTokens: Int
+        public var reason: String
+        public var reused: Bool { reusedTokens > 0 }
+        public init(reusedTokens: Int = 0, reason: String = "") {
+            self.reusedTokens = reusedTokens
+            self.reason = reason
+        }
     }
 
     /// Sampling settings. Defaults follow Qwen's recommendation for
@@ -175,14 +192,36 @@ public final class SwiftletSession: @unchecked Sendable {
     // Conversation cache: the decode state persists across turns, so a
     // follow-up message only needs its own turn prefilled — without this,
     // every follow-up reprocesses the entire conversation (which at ~1 s/token
-    // on a phone reads as "stuck on ..."). Whether the incoming messages
-    // extend the cached conversation is decided by comparing message content,
-    // not template tokens: the re-rendered template drops the think block from
-    // past assistant turns, so token-prefix comparison always diverges.
+    // on a phone reads as "stuck on ..."). Whether the incoming prompt extends
+    // the cached conversation is decided on token ids: `fedIds` is written
+    // where tokens are fed to the model and is the only description of the
+    // state anyone consults (the record in colibri's kv_prefix.h). A prompt
+    // that begins with exactly those ids prefills only its tail; one that
+    // diverges anywhere starts over — a changed earlier message, a reply the
+    // client re-tokenizes differently, or a thinking-family template whose
+    // re-render of a past assistant turn drops the empty think block the
+    // state was fed. That last case is deliberate: keying on message strings
+    // (what this did before) reused a state holding `<think>\n\n</think>\n\n`
+    // where a cold prefill of the same transcript holds nothing, so warm and
+    // cold answered from different contexts. Reuse is all or nothing: nothing
+    // here can rewind a state.
     private var convState = QwenCPUModel.DecodeState()
-    private var lastMessages: [[String: String]] = []
-    private var lastReplyText = ""
-    private var statePrimed = false
+    /// Token ids the current `convState` was built from, in position order.
+    private var fedIds: [Int] = []
+    /// Set when a step threw after it may have advanced the state, so the
+    /// record no longer describes it; such a state is dropped, never reused.
+    private var fedTainted = false
+
+    /// Off-switch for prefix reuse (`SWIFTLET_KV_PREFIX=0` in the environment
+    /// sets it off at init): every turn is then a cold prefill. The B arm of
+    /// the A/B that shows reuse changes nothing but the time. Safe to set from
+    /// any thread; read once per request on the generation queue.
+    public var prefixReuseEnabled: Bool {
+        get { genLock.lock(); defer { genLock.unlock() }; return _prefixReuseEnabled }
+        set { genLock.lock(); _prefixReuseEnabled = newValue; genLock.unlock() }
+    }
+    private var _prefixReuseEnabled =
+        ProcessInfo.processInfo.environment["SWIFTLET_KV_PREFIX"] != "0"
 
     /// Drops the cached conversation (e.g. when the user starts a new chat).
     /// A generation in flight is cancelled first, then the reset is ordered
@@ -203,9 +242,24 @@ public final class SwiftletSession: @unchecked Sendable {
     /// The queue-confined form used by streamChat itself.
     private func resetConversationState() {
         convState = QwenCPUModel.DecodeState()
-        lastMessages = []
-        lastReplyText = ""
-        statePrimed = false
+        fedIds = []
+        fedTainted = false
+    }
+
+    /// The one place tokens reach the model. The record is appended only
+    /// after the step returns; a step that throws may have advanced the state
+    /// partway (Metal observes cancellation between command buffers), so the
+    /// record is marked tainted and the state is dropped at the end of the
+    /// turn.
+    private func feed(_ tokens: [Int], shouldCancel: () -> Bool) throws -> [Float] {
+        do {
+            let logits = try model.step(tokens, state: convState, shouldCancel: shouldCancel)
+            fedIds += tokens
+            return logits
+        } catch {
+            fedTainted = true
+            throw error
+        }
     }
 
     // Memory-pressure shrink coordination: shrinkCache replaces the expert
@@ -308,29 +362,29 @@ public final class SwiftletSession: @unchecked Sendable {
         return ids
     }
 
-    /// If `messages` extends the conversation the model state already holds
-    /// (same prior messages + our own last reply + one new user message),
-    /// returns the tokens for just the new turn; nil means start clean.
-    private func continuationIds(_ messages: [[String: String]]) -> [Int]? {
-        guard statePrimed,
-              messages.count == lastMessages.count + 2,
-              let newUser = messages.last, newUser["role"] == "user",
-              messages[messages.count - 2]["role"] == "assistant"
-        else { return nil }
-        for (a, b) in zip(lastMessages, messages)
-        where a["role"] != b["role"] || a["content"] != b["content"] { return nil }
-        let echoed = (messages[messages.count - 2]["content"] ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard echoed == lastReplyText.trimmingCharacters(in: .whitespacesAndNewlines)
-        else { return nil }
-        // The state ends right after our reply text (EOS is never fed to the
-        // model). Close the assistant turn, open the new user turn, and match
-        // the template's generation-prompt style: thinking-family templates
-        // get the empty think block (reasoning off), instruct ones don't.
-        let turn = "<|im_end|>\n<|im_start|>user\n" + (newUser["content"] ?? "")
-            + "<|im_end|>\n<|im_start|>assistant\n"
-            + (usesThinkPrompt ? "<think>\n\n</think>\n\n" : "")
-        return encodeText(turn)
+    /// How many leading tokens of `prompt` the cached state already holds:
+    /// all of `fedIds`, or none. Requires at least one new token — a prompt
+    /// equal to or shorter than the record would need the state rewound,
+    /// which nothing here can do, and prefilling zero tokens leaves nothing
+    /// to sample from. The reason is reported either way.
+    func prefixReuse(for prompt: [Int]) -> PrefixReuse {
+        guard prefixReuseEnabled else {
+            return PrefixReuse(reason: "disabled (SWIFTLET_KV_PREFIX=0 or prefixReuseEnabled = false)")
+        }
+        guard !fedIds.isEmpty else { return PrefixReuse(reason: "no cached state") }
+        guard !fedTainted else { return PrefixReuse(reason: "cached state is tainted") }
+        guard fedIds.count < prompt.count else {
+            return PrefixReuse(reason: "prompt (\(prompt.count) tokens) does not extend the "
+                + "cached state (\(fedIds.count) tokens); no rewind")
+        }
+        if let i = fedIds.indices.first(where: { fedIds[$0] != prompt[$0] }) {
+            return PrefixReuse(reason: "prompt diverges from the cached state at token \(i) "
+                + "of \(fedIds.count) (cached \(fedIds[i]), prompt \(prompt[i]))")
+        }
+        return PrefixReuse(
+            reusedTokens: fedIds.count,
+            reason: "prompt extends the cached state by \(prompt.count - fedIds.count) tokens"
+        )
     }
 
     /// Drops the replacement characters an incomplete trailing multi-byte
@@ -464,13 +518,21 @@ public final class SwiftletSession: @unchecked Sendable {
                         return
                     }
 
+                    // The whole prompt, rendered the way a fresh conversation
+                    // is; the cached state is compared against it on token
+                    // ids, and only the tail past the match is fed.
+                    let prompt = try self.freshPromptIds(messages)
+                    let reuse = self.prefixReuse(for: prompt)
                     let suffix: [Int]
-                    if let delta = self.continuationIds(messages) {
-                        suffix = delta
+                    if reuse.reused {
+                        suffix = Array(prompt[reuse.reusedTokens...])
                     } else {
                         self.resetConversationState()
-                        suffix = try self.freshPromptIds(messages)
+                        suffix = prompt
                     }
+                    print("[SwiftletSession] prefix: " + (reuse.reused
+                        ? "reusing \(reuse.reusedTokens) of \(prompt.count) prompt tokens (\(reuse.reason))"
+                        : "none, prefilling \(prompt.count) tokens (\(reuse.reason))"))
                     // Admission runs before any model call, so a rejection
                     // leaves the cached conversation exactly as the client
                     // last saw it. Keep it: a shorter retry can then continue
@@ -500,10 +562,7 @@ public final class SwiftletSession: @unchecked Sendable {
                     var finishReason = GenerationFinishReason.length
 
                     do {
-                        var logits = try self.model.step(
-                            suffix, state: self.convState,
-                            shouldCancel: { control.isCancelled }
-                        )
+                        var logits = try self.feed(suffix, shouldCancel: { control.isCancelled })
                         prefillDone = Date()
 
                         for _ in 0..<admittedMaxNew {
@@ -567,10 +626,7 @@ public final class SwiftletSession: @unchecked Sendable {
                             }
 
                             let t0 = Date()
-                            logits = try self.model.step(
-                                [best], state: self.convState,
-                                shouldCancel: { control.isCancelled }
-                            )
+                            logits = try self.feed([best], shouldCancel: { control.isCancelled })
                             decodeSeconds += -t0.timeIntervalSinceNow
                         }
                     } catch GenerationInterruption.cancelled {
@@ -607,27 +663,22 @@ public final class SwiftletSession: @unchecked Sendable {
                     if control.isCancelled { finishReason = .cancelled }
                     print("[SwiftletSession] stop: \(finishReason.rawValue) after \(generated.count) tokens")
 
-                    // EOS and length end with state exactly matching the text
-                    // exposed to the caller. An arbitrary text stop may span
-                    // already-fed token pieces, and cancellation can interrupt
-                    // a prompt/token partway through, so neither is reusable
-                    // without a real DecodeState snapshot/rollback facility.
-                    let reusable = finishReason != .cancelled
-                        && !matchedTextStop && !generated.isEmpty
-                    if reusable {
-                        self.lastMessages = messages
-                        self.lastReplyText = stopFilter.output
-                        self.statePrimed = true
-                    } else {
-                        self.resetConversationState()
-                    }
+                    // The record is exact for everything that was fed, so EOS,
+                    // length and a text stop all leave a state the next prompt
+                    // can be compared against (it either extends those ids or
+                    // it does not; a stop that spans fed pieces simply never
+                    // matches). Only a step that threw partway — a cancellation
+                    // observed inside a Metal step — leaves a state the record
+                    // cannot vouch for; that one is dropped here.
+                    if self.fedTainted { self.resetConversationState() }
 
                     self.storeMetrics(Metrics(
                         promptTokens: suffix.count,
                         generatedTokens: generated.count,
                         timeToFirstToken: (firstTokenAt ?? prefillDone).timeIntervalSince(start),
                         tokensPerSecond: decodeSeconds > 0 ? Double(generated.count) / decodeSeconds : 0,
-                        finishReason: finishReason
+                        finishReason: finishReason,
+                        prefixReuse: reuse
                     ))
                 } catch {
                     self.resetConversationState()
