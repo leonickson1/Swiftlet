@@ -106,6 +106,15 @@ swift build -c release
 The same command also repacks raw MLX checkpoints
 (`--from-hf mlx-community/...` or `--source /path/to/checkpoint`).
 
+The expert cache is sized for the machine: at startup the runtime takes the
+GPU's working set, subtracts the resident dense weights it just placed, the KV
+cache at the model's full context and a margin, and clamps the result between
+one token's working set and the whole expert pool. The derivation is printed
+once (`expert cache budget ...`). `--cache-gb` is a ceiling on that default:
+a value the host can hold beside the model is honoured as given, a value it
+cannot hold is refused at startup naming the request, the ceiling and the
+shortfall. The budget only changes speed, never output.
+
 Requirements: Apple Silicon, macOS 14+ or iOS 17+, free SSD space for the
 container (18 GB for the 35B, 34 GB for the 8-bit 35B, 42 GB for the 80B).
 

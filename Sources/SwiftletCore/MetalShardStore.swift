@@ -14,9 +14,19 @@ final class MetalShardStore {
 
     private let device: MTLDevice
     private var mappings: [URL: MTLBuffer] = [:]
+    /// Bytes every `residentLinear` buffer occupies, at Metal's allocated
+    /// size (never below the requested length). The resident dense trunk the
+    /// expert-cache budget is priced against.
+    private(set) var residentBytes = 0
+    private(set) var residentLinearCount = 0
 
     init(device: MTLDevice) {
         self.device = device
+    }
+
+    private func chargeResident(_ buffer: MTLBuffer) {
+        residentBytes += max(buffer.length, buffer.allocatedSize)
+        residentLinearCount += 1
     }
 
     func buffer(for url: URL) throws -> MTLBuffer {
@@ -87,6 +97,7 @@ final class MetalShardStore {
             try ckpt.withRawTensor(path + ".biases") { _, bytes in
                 buf.contents().advanced(by: wLen + sLen).copyMemory(from: bytes.baseAddress!, byteCount: bLen)
             }
+            chargeResident(buf)
             let perWord = 32 / spec.bits
             return GPULinear(
                 wBuffer: buf, sBuffer: buf, bBuffer: buf,
@@ -106,6 +117,7 @@ final class MetalShardStore {
         try ckpt.withRawTensor(path + ".weight") { _, bytes in
             buf.contents().copyMemory(from: bytes.baseAddress!, byteCount: wLen)
         }
+        chargeResident(buf)
         let dtype: UInt32 = wInfo.dtype == "F32" ? 0 : (wInfo.dtype == "F16" ? 1 : 2)
         return GPULinear(
             wBuffer: buf, sBuffer: buf, bBuffer: buf,

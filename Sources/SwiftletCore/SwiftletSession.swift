@@ -80,12 +80,13 @@ public final class SwiftletSession: @unchecked Sendable {
     }
 
     /// Loads tokenizer + model. Prefers the Metal streaming engine; falls back
-    /// to the CPU reference if Metal is unavailable. `cacheBudgetGB` bounds the
-    /// expert cache (keep small on iOS; jetsam is unforgiving).
-    public init(modelDir: URL, retainAllLayers: Bool = false, cacheBudgetGB: Double = 2) async throws {
+    /// to the CPU reference if Metal is unavailable. `cacheBudgetGB` is a
+    /// ceiling on the expert cache; nil derives the budget from this host
+    /// (working set less the resident dense weights, the KV cache at full
+    /// context and a margin, clamped to the expert pool), and a value the host
+    /// cannot hold beside the model is refused by name.
+    public init(modelDir: URL, retainAllLayers: Bool = false, cacheBudgetGB: Double? = nil) async throws {
         self.modelDir = modelDir
-        self.cacheBudgetGB = cacheBudgetGB
-        self.appliedCacheBudgetGB = cacheBudgetGB
         print("[SwiftletSession] loading tokenizer...")
         let tokenizer = try await AutoTokenizer.from(modelFolder: modelDir)
         encodeText = { tokenizer.encode(text: $0) }
@@ -97,6 +98,11 @@ public final class SwiftletSession: @unchecked Sendable {
             let gpu = try QwenMetalModel(modelDir: modelDir, cacheBudgetGB: cacheBudgetGB)
             model = gpu
             usesGPU = true
+            // What the cache actually runs at -- derived or the admitted
+            // ceiling -- is what a return to normal pressure restores.
+            let resolved = gpu.expertCacheBudgetBytes.map { Double($0) / 1_073_741_824 }
+            self.cacheBudgetGB = resolved ?? cacheBudgetGB ?? 0
+            self.appliedCacheBudgetGB = self.cacheBudgetGB
             print("[SwiftletSession] Metal model ready")
         } catch {
             // A .qpack container streams its experts through the Metal cache
@@ -108,6 +114,10 @@ public final class SwiftletSession: @unchecked Sendable {
             )
             if isContainer { throw error }
             print("[SwiftletSession] Metal init FAILED (\(error)), falling back to CPU (heavy)")
+            // No expert cache on the CPU path; keep the request so the
+            // pressure handler's numbers stay meaningful.
+            self.cacheBudgetGB = cacheBudgetGB ?? 0
+            self.appliedCacheBudgetGB = self.cacheBudgetGB
             let cpu = try QwenCPUModel(modelDir: modelDir)
             cpu.retainAllLayers = retainAllLayers
             model = cpu
