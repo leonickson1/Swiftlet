@@ -106,6 +106,11 @@ func flag(_ name: String) -> String? {
 }
 guard let modelPath = flag("--model") else {
     print("usage: swiftlet-server --model <dir> [--port 8080] [--cache-gb 2]")
+    print("")
+    print("exit codes: 2 usage; a model that fails to open exits by kind, one stderr line naming it:")
+    for kind in [StartupFailure.container(""), .config(""), .resource(""), .backend("")] {
+        print("  \(kind.exitCode) \(kind.kindName)")
+    }
     exit(2)
 }
 let port = Int(flag("--port") ?? "8080") ?? 8080
@@ -117,7 +122,23 @@ FileHandle.standardError.write(Data("loading model + tokenizer...\n".utf8))
 // from the .qpack blobs, so a 35B/80B container serves in a few GB of RAM.
 // (The CPU model reader cannot serve containers: their experts are not in
 // model.safetensors.)
-let session = try await SwiftletSession(modelDir: modelURL, cacheBudgetGB: cacheGB)
+/// A model that cannot open is reported once, by kind, and the process exits
+/// with that kind's code (see `StartupFailure`). Before this every failure --
+/// a missing directory, a refused model_type, no Metal device, a cache budget
+/// too small for one layer -- surfaced as the same uncaught-error trap, and a
+/// supervisor could not tell which one it was restarting into.
+@Sendable func exitStartup(_ failure: StartupFailure) -> Never {
+    FileHandle.standardError.write(Data(
+        "swiftlet-server: startup failed (\(failure.kindName)): \(failure.reason)\n".utf8
+    ))
+    exit(failure.exitCode)
+}
+let session: SwiftletSession
+do {
+    session = try await SwiftletSession(modelDir: modelURL, cacheBudgetGB: cacheGB)
+} catch {
+    exitStartup(StartupFailure.classify(error))
+}
 let modelName: String = {
     let configURL = modelURL.appendingPathComponent("config.json")
     if let cfg = try? JSONSerialization.jsonObject(with: Data(contentsOf: configURL)) as? [String: Any],
@@ -558,6 +579,13 @@ let bootstrap = ServerBootstrap(group: group)
         }
     }
 
-let channel = try await bootstrap.bind(host: "127.0.0.1", port: port).get()
+let channel: Channel
+do {
+    channel = try await bootstrap.bind(host: "127.0.0.1", port: port).get()
+} catch {
+    // The model is loaded by now; a port that cannot be taken is the host's
+    // limit, not the model's, and is named as such.
+    exitStartup(.resource("cannot listen on 127.0.0.1:\(port): \(StartupFailure.describe(error))"))
+}
 print("swiftlet-server listening on http://127.0.0.1:\(port)/v1 (model: \(modelName))")
 try await channel.closeFuture.get()
