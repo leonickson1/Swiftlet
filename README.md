@@ -160,7 +160,11 @@ Swiftlet is a library first:
    on loopback, so any chat UI that talks to OpenAI-compatible endpoints can
    use a streamed local model. It honors string/array `stop`, reports `stop`
    versus `length`, and cancels queued or active generation when the client
-   disconnects.
+   disconnects. A model that fails to open exits by kind, with one stderr
+   line naming it: 3 `container` (directory missing, incomplete or damaged),
+   4 `config` (`config.json` refused by name), 5 `resource` (cache budget,
+   KV allocation or port), 6 `backend` (no Metal device, kernels); 2 is a
+   usage error.
 4. **An app.** [Priv AI](https://apps.apple.com/us/app/priv-ai/id6765706001)
    on iOS embeds SwiftletCore as its streamed-model engine. End users tap
    Download and chat. Nothing here is terminal-only. The app itself is open

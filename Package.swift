@@ -22,6 +22,7 @@ let package = Package(
             name: "SwiftletCore",
             dependencies: [
                 .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(name: "Hub", package: "swift-transformers"),
             ],
             resources: [.copy("Kernels.metal.txt")]
         ),

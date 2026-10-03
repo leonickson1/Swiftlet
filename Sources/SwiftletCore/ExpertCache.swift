@@ -60,6 +60,20 @@ public final class ExpertCache {
     private var maxSlots: Int
     private var physicalBudget: ExpertCacheBudget
 
+    public enum Error: Swift.Error, CustomStringConvertible {
+        /// The expert cache budget cannot hold the minimum working set. This
+        /// is a resource limit of the host or the caller's `--cache-gb`, not
+        /// a fault in the container, so it is named apart from the
+        /// `Checkpoint` errors a corrupt layout raises.
+        case budgetTooSmall(slots: Int, required: Int)
+        public var description: String {
+            switch self {
+            case .budgetTooSmall(let slots, let required):
+                return "expert cache budget fits \(slots) logical slots; at least \(required) required"
+            }
+        }
+    }
+
     init(containerDir: URL, device: MTLDevice, budgetBytes: Int) throws {
         self.device = device
         reader = try QpackExpertReader(containerDir: containerDir)
@@ -77,10 +91,7 @@ public final class ExpertCache {
             limitBytes: budgetBytes, stride: stride, totalSlots: total
         ) else {
             let availableSlots = budgetBytes >= 0 ? budgetBytes / stride : 0
-            throw Checkpoint.Error.badShape(
-                "expert cache budget fits \(availableSlots) logical slots; "
-                    + "at least \(min(16, total)) required"
-            )
+            throw Error.budgetTooSmall(slots: availableSlots, required: min(16, total))
         }
         maxSlots = capacity
         physicalBudget = ExpertCacheBudget(limitBytes: budgetBytes)
