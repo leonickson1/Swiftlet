@@ -287,4 +287,51 @@ import Testing
         #expect(!decision.reused)
         #expect(decision.reason == "no cached state", Comment(rawValue: decision.reason))
     }
+
+    /// The record must be the session's own storage, never a view of the
+    /// request's. FreeToken #559 had radix keys holding views into the
+    /// request's id buffer, so a 64-byte key pinned the request's whole
+    /// input+output allocation. Here the prompt arrives in a buffer reserved
+    /// for a large output budget and is kept alive by the caller; after the
+    /// turn the record holds exactly the fed ids, in storage sized to them
+    /// (not the request's reservation) and at a different address.
+    @Test func recordDoesNotRetainTheRequestBuffer() async throws {
+        final class RequestBuffer: @unchecked Sendable {
+            var ids: [Int] = []
+            var base: UnsafeRawPointer?
+        }
+        let reserved = 1 << 17
+        let request = RequestBuffer()
+        let model = try HistoryModel(modelDir: Self.fixturesDir.appendingPathComponent("tiny-model"))
+        let session = SwiftletSession(
+            testingModel: model,
+            modelDir: model.modelDir,
+            encodeText: { Self.encode($0) },
+            decodeTokens: { Self.decode($0) },
+            renderMessages: { messages in
+                var ids = Self.render(messages, think: false)
+                ids.reserveCapacity(reserved)
+                // Hold the buffer for the test's duration so the address
+                // comparison below is between two live allocations.
+                request.ids = ids
+                request.base = ids.withUnsafeBufferPointer { UnsafeRawPointer($0.baseAddress) }
+                return ids
+            },
+            usesThinkPrompt: false
+        )
+        let harness = Harness(model: model, session: session)
+        let reply = try await Self.ask(harness, Self.q1)
+        #expect(reply.count == Self.turns)
+        #expect(request.ids.capacity >= reserved)
+
+        let record = session.cachedConversationIds()
+        #expect(record == Self.render(Self.q1, think: false) + Self.bytes(reply))
+        #expect(
+            record.capacity < reserved,
+            "record capacity \(record.capacity) carries the request's reservation of \(reserved)"
+        )
+        let recordBase = record.withUnsafeBufferPointer { UnsafeRawPointer($0.baseAddress) }
+        #expect(recordBase != nil)
+        #expect(recordBase != request.base, "record storage aliases the request buffer")
+    }
 }

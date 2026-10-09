@@ -251,6 +251,12 @@ public final class SwiftletSession: @unchecked Sendable {
         fedTainted = false
     }
 
+    /// Test seam: the ids the cached state was built from. Read on the
+    /// generation queue, so it is ordered behind any turn in flight.
+    func cachedConversationIds() -> [Int] {
+        generationQueue.sync { fedIds }
+    }
+
     /// The one place tokens reach the model. The record is appended only
     /// after the step returns; a step that throws may have advanced the state
     /// partway (Metal observes cancellation between command buffers), so the
