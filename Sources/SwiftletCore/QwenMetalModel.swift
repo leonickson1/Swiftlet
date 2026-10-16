@@ -153,6 +153,10 @@ public final class QwenMetalModel {
         var gpuTimedCommandBuffers = 0
         var gpuUntimedCommandBuffers = 0
         var completedWithoutThrow = false
+        /// True from the first layer of a token (or chunk) until its
+        /// `position` advance: a throw in that window leaves the state
+        /// half-advanced (see DecodeState.tainted).
+        var stateMutatedMidToken = false
         var timeline: [CommandBufferSample] = []
         var phaseDispatches: [StepPhase: Int] = [:]
         var phaseEncodeSeconds: [StepPhase: Double] = [:]
@@ -1000,24 +1004,35 @@ public final class QwenMetalModel {
             let wanted = min(max(1, chunkTokens), tokens.count)
             if ensurePrefillCapacity(wanted) { chunkCapacity = wanted }
         }
-        if chunkCapacity > 0 {
-            logits = try prefillLayerMajor(
-                tokens, state: state, chunkCapacity: chunkCapacity, shouldCancel: shouldCancel
-            )
-        } else {
-            for (index, t) in tokens.enumerated() {
-                try checkGenerationCancellation(shouldCancel)
-                // S1a LM-head elision: a multi-token call consumes only the
-                // final position's logits, so intermediate vocabulary
-                // projections are unnecessary.
-                let projectLogits = index == tokens.count - 1
-                logits = try stepOne(
-                    t, state: state, projectLogits: projectLogits, shouldCancel: shouldCancel
+        do {
+            if chunkCapacity > 0 {
+                logits = try prefillLayerMajor(
+                    tokens, state: state, chunkCapacity: chunkCapacity, shouldCancel: shouldCancel
                 )
-                state.position += 1
-                counters.tokensProcessed += 1
-                try checkGenerationCancellation(shouldCancel)
+            } else {
+                for (index, t) in tokens.enumerated() {
+                    try checkGenerationCancellation(shouldCancel)
+                    // S1a LM-head elision: a multi-token call consumes only the
+                    // final position's logits, so intermediate vocabulary
+                    // projections are unnecessary.
+                    let projectLogits = index == tokens.count - 1
+                    logits = try stepOne(
+                        t, state: state, projectLogits: projectLogits, shouldCancel: shouldCancel
+                    )
+                    state.position += 1
+                    counters.stateMutatedMidToken = false
+                    counters.tokensProcessed += 1
+                    try checkGenerationCancellation(shouldCancel)
+                }
             }
+        } catch {
+            // A throw after a layer's command buffer ran and before `position`
+            // advanced leaves the GPU recurrence, the KV mirror, and the
+            // position disagreeing. The state stays steppable on this instance
+            // (the caller is told to discard it); snapshotting it, or loading
+            // it into another instance's buffers, is refused.
+            if counters.stateMutatedMidToken { state.tainted = true }
+            throw error
         }
         counters.completedWithoutThrow = true
         return logits
@@ -1041,6 +1056,7 @@ public final class QwenMetalModel {
 
         for li in 0..<cfg.numHiddenLayers {
             try checkGenerationCancellation(shouldCancel)
+            activeStepCounters?.stateMutatedMidToken = true
             let layer = layers[li]
             var x = h
             QwenCPUModel.rmsNorm(&x, rows: 1, dim: D, weight: layer.inputNorm, eps: Float(cfg.rmsNormEps))
@@ -1668,6 +1684,7 @@ extension QwenMetalModel {
 
         for li in 0..<cfg.numHiddenLayers {
             try checkGenerationCancellation(shouldCancel)
+            activeStepCounters?.stateMutatedMidToken = true
             let L = layers[li]
             let fl = fastLayers[li]
 
@@ -2291,6 +2308,7 @@ extension QwenMetalModel {
         var pending: PendingChunkMoE?
 
         for li in 0..<cfg.numHiddenLayers {
+            activeStepCounters?.stateMutatedMidToken = true
             let L = layers[li]
             let fl = fastLayers[li]
 
@@ -2401,6 +2419,7 @@ extension QwenMetalModel {
         commitAndWait(cb)
 
         state.position += S
+        activeStepCounters?.stateMutatedMidToken = false
         activeStepCounters?.tokensProcessed += S
 
         guard projectLogits else { return [] }

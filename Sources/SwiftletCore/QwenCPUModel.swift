@@ -196,6 +196,13 @@ public final class QwenCPUModel {
         /// has only ever been stepped on the CPU engine. While set, the
         /// `convTail` / `deltaState` fields here are the last captured copy.
         weak var boundOn: AnyObject?
+        /// Set when a step threw after it had begun mutating this state and
+        /// before `position` advanced: some layers' KV rows or recurrence
+        /// moved on, the rest did not, so the fields no longer describe one
+        /// point in the sequence. Stepping it on the same instance continues
+        /// as before (the caller is told to discard it); snapshotting it, or
+        /// loading it into a Metal instance's buffers, is refused. Never cleared.
+        var tainted = false
         public init() {}
     }
 
@@ -267,11 +274,22 @@ public final class QwenCPUModel {
         for (s, t) in tokens.enumerated() {
             for i in 0..<D { h[s * D + i] = embed[t * D + i] }
         }
-        for li in 0..<cfg.numHiddenLayers {
+        // A throw once a layer has begun mutating `state` (its KV rows,
+        // conv tail, or delta state) and before `position` advances leaves
+        // the state half-advanced; mark it so a snapshot refuses it instead
+        // of persisting a state no restore could continue from.
+        var mutating = false
+        do {
+            for li in 0..<cfg.numHiddenLayers {
+                try checkGenerationCancellation(shouldCancel)
+                mutating = true
+                h = try layerForward(h, S: S, layerIndex: li, state: state)
+            }
             try checkGenerationCancellation(shouldCancel)
-            h = try layerForward(h, S: S, layerIndex: li, state: state)
+        } catch {
+            if mutating { state.tainted = true }
+            throw error
         }
-        try checkGenerationCancellation(shouldCancel)
         state.position += S
 
         var last = Array(h[(S - 1) * D..<S * D])

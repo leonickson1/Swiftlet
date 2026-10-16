@@ -28,12 +28,18 @@ extension QwenMetalModel {
     /// state mid-sequence: nothing. Position 0 (fresh): the recurrent
     /// buffers are zeroed; KV rows are simply overwritten from row 0 by the
     /// following steps. Otherwise: capture the previous state, then load
-    /// `state`. A state that cannot be loaded is refused before anything is
-    /// captured or written, so the bound state stays bound and intact.
+    /// `state`. A state that cannot be loaded — mis-shaped, or left
+    /// half-advanced by a step that threw (`tainted`) — is refused before
+    /// anything is captured or written, so the bound state stays bound and
+    /// intact. The bound state itself is never refused here: a tainted state
+    /// keeps `main`'s contract that its caller discards it.
     func bindState(_ state: QwenCPUModel.DecodeState) throws {
         if let bound = boundState, bound === state {
             if state.position == 0 { resetGPUState() }
             return
+        }
+        guard !state.tainted else {
+            throw RuntimeError.inconsistentState("step threw mid-token")
         }
         if state.position > 0 { try validateForLoad(state) }
         if let previous = boundState {
@@ -66,6 +72,9 @@ extension QwenMetalModel {
     /// state per DeltaNet layer, K and V rows for its position per attention
     /// layer. Touches nothing.
     func validateForLoad(_ state: QwenCPUModel.DecodeState) throws {
+        guard !state.tainted else {
+            throw RuntimeError.inconsistentState("step threw mid-token")
+        }
         let cfg = config
         let tailFloats = (cfg.linearConvKernelDim - 1) * cfg.convDim
         let stateFloats = cfg.linearNumValueHeads * cfg.linearValueHeadDim * cfg.linearKeyHeadDim
