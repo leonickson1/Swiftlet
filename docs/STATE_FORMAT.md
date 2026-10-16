@@ -231,10 +231,39 @@ Tools, Swift 6.3.3), fixture gate on a fresh tree of this branch at
   (loading into `fixtures/tiny-model`), `truncated` (a 300-byte prefix),
   `--chat` together with `--load-state`, an empty continuation.
 
-**Real-model resume check: pending.** The resume check on the production
-container (A = N tokens uninterrupted; B = fewer tokens then `--save-state`;
-C = a fresh process with `--load-state` fed A's next id; B == A's prefix and
-C == A's remainder, id for id, plus `modelMismatch` / `truncated` through the
-CLI) has not yet been run on this build. The 2026-09-02 run recorded against
-the v1 draft is deliberately not carried here; this section is to be replaced
-by a run of this build before merge.
+Real-model resume check, 2026-10-16, same box and toolchain, release binary
+of this branch at `c8b8302`, container
+`/Users/Shared/ai-models/qpack/Qwen3.6-35B-A3B-4bit-qpack` (Qwen3.6-35B-A3B,
+4-bit, 40 layers — the geometry quoted above; no `hashes.json`, so identity
+scheme 2), `--gpu` only: a qpack cannot be served by the CPU engine, so this
+is a Metal-only check. Greedy, `--ids 12162,5028,264,854,11` ("Once upon a
+time,"), each step its own process, wall time (`real`) for the whole
+process (open, fast path, decode) and peak RSS from `/usr/bin/time -l`:
+
+- A = `--max-new 32` →
+  `1017,557,264,3777,95704,6725,8254,13,8254,557,2098,1083,6165,6063,321,9939,`
+  `310,12804,491,2433,13,3648,1834,11,8254,1669,264,24577,2236,421,14466,883`
+  (32 tokens; decode 11.4 tok/s; 5.5 s, 7.7 GB).
+- B = `--max-new 16 --save-state` →
+  `1017,557,264,3777,95704,6725,8254,13,8254,557,2098,1083,6165,6063,321,9939`
+  = A[1..16]; "saved state: … (66725296 bytes, position 21)". 66 725 296
+  bytes is exactly the layout above for 10 attention and 30 DeltaNet layers
+  at position 21 (80 sections); the header read back: version 2, identity
+  scheme 2, `rotaryDims` 64, `writerContextCapacity` 262144. 1.6 s, 6.8 GB.
+- C = a fresh process, `--load-state --ids 310 --max-new 15` (310 = A[17]) →
+  `12804,491,2433,13,3648,1834,11,8254,1669,264,24577,2236,421,14466,883`
+  = A[18..32]; "loaded state: … (66725296 bytes, position 21, written at
+  capacity 262144; this engine's capacity 262144)". Decode 14.7 tok/s; 1.5 s,
+  5.8 GB.
+- Refused through the CLI: the 35B snapshot into `fixtures/tiny-model-q4`
+  (CPU and Metal) → `modelMismatch`; the snapshot minus its last byte, on
+  the 35B container → `truncated`; the snapshot into
+  `Qwen3.6-35B-A3B-4bit-DWQ.qpack` (another 4-bit container of the same
+  model, with a different `config.json`, `manifest.json` and dense shard) →
+  `modelMismatch`. That last refusal is scheme 2 seeing a structural
+  difference; two containers with identical structure and different weight
+  values would share a scheme-2 identity, and that case is not exercised
+  here.
+- Identity scheme 1 (`hashes.json`) was not exercised: neither container on
+  the box ships a `hashes.json`, nor does any fixture, so the scheme-1 arm
+  of `ModelIdentity.compute` has no test yet.
