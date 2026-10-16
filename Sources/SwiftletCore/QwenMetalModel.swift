@@ -339,7 +339,9 @@ public final class QwenMetalModel {
     var sBuf: MTLBuffer?
     var hBuf: MTLBuffer?
     var reg = Regions()
-    var boundStateID: ObjectIdentifier?
+    /// The state whose conv history and delta recurrence currently sit in
+    /// the fast path's per-layer GPU buffers (see bindState).
+    weak var boundState: QwenCPUModel.DecodeState?
     struct PendingMoE {
         var bufs: [MTLBuffer]
         var weights: [Float]
@@ -584,6 +586,15 @@ public final class QwenMetalModel {
                 // kCache/vCache grow on demand in ensureKVCapacity.
             }
             fastLayers.append(fl)
+        }
+    }
+
+    deinit {
+        // The bound state's live recurrence dies with these buffers: hand it
+        // back so the state stays usable on another engine or instance.
+        if let state = boundState {
+            if state.position > 0 { captureRecurrentState(into: state) }
+            state.boundOn = nil
         }
     }
 
@@ -1467,7 +1478,7 @@ extension QwenMetalModel {
             count: n))
     }
 
-    private func resetGPUState() {
+    func resetGPUState() {
         for fl in fastLayers {
             if let h = fl.hist { memset(h.contents(), 0, h.length) }
             if let st = fl.state { memset(st.contents(), 0, st.length) }
@@ -1645,10 +1656,7 @@ extension QwenMetalModel {
     ) throws -> [Float] {
         let cfg = config
         let D = cfg.hiddenSize
-        if boundStateID != ObjectIdentifier(state) || state.position == 0 {
-            boundStateID = ObjectIdentifier(state)
-            if state.position == 0 { resetGPUState() }
-        }
+        try bindState(state)
 
         let h0 = try embeddingRow(token)
         h0.withUnsafeBufferPointer {
@@ -1943,9 +1951,13 @@ extension QwenMetalModel {
     /// for attention, so the step surfaces the allocation failure.
     public enum RuntimeError: Swift.Error {
         case kvCacheAllocationFailed(layer: Int, rows: Int)
+        /// A `DecodeState` handed to the fast path cannot be loaded into the
+        /// GPU buffers: a field is missing or does not fit this model's
+        /// geometry for the state's position (see bindState / loadGPUState).
+        case inconsistentState(String)
     }
 
-    private var kvRowFloats: Int { config.numKeyValueHeads * config.headDim }
+    var kvRowFloats: Int { config.numKeyValueHeads * config.headDim }
 
     /// Grows layer `li`'s GPU KV cache to hold at least `rows` positions
     /// (doubling; written rows copied across). Only called between command
@@ -2265,10 +2277,7 @@ extension QwenMetalModel {
         let cfg = config
         let D = cfg.hiddenSize
         let S = chunk.count
-        if boundStateID != ObjectIdentifier(state) || state.position == 0 {
-            boundStateID = ObjectIdentifier(state)
-            if state.position == 0 { resetGPUState() }
-        }
+        try bindState(state)
         let basePosition = state.position
 
         for (t, token) in chunk.enumerated() {

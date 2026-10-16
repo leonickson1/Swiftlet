@@ -189,6 +189,13 @@ public final class QwenCPUModel {
         var convTail: [Int: [Float]] = [:]
         /// layerIndex -> delta recurrence state, [vHead][vDim][kDim].
         var deltaState: [Int: [Float]] = [:]
+        /// The Metal instance whose GPU buffers hold this state's live conv
+        /// history and delta recurrence while it is bound there (see
+        /// QwenMetalModel.bindState); nil once that instance captured them
+        /// back (a switch to another state, or its deinit), or if the state
+        /// has only ever been stepped on the CPU engine. While set, the
+        /// `convTail` / `deltaState` fields here are the last captured copy.
+        weak var boundOn: AnyObject?
         public init() {}
     }
 
