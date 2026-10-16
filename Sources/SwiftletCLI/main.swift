@@ -228,6 +228,11 @@ func runVerify(modelDir: String, fixturesPath: String) throws {
 /// End-to-end text generation on the CPU reference runtime.
 func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawIds: [Int]?) async throws {
     let url = URL(fileURLWithPath: modelDir)
+    let loadStatePath = flagValue(CommandLine.arguments, "--load-state")
+    let saveStatePath = flagValue(CommandLine.arguments, "--save-state")
+    // A resumed sequence is continued with raw tokens; applying the chat
+    // template would wrap the continuation in a new turn (docs/STATE_FORMAT.md).
+    if chat, loadStatePath != nil { throw CLIError.chatWithLoadedState }
     FileHandle.standardError.write(Data("loading tokenizer + model...\n".utf8))
     let tokenizer: Tokenizer? = rawIds == nil ? try await AutoTokenizer.from(modelFolder: url) : nil
     let model: any InferenceModel
@@ -281,13 +286,33 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
         if let vs = obj["eos_token_id"] as? [Int] { eos.formUnion(vs) }
     }
 
+    // --load-state resumes a saved state; --prompt/--ids are then the
+    // continuation of that sequence (raw tokens, no template). The snapshot
+    // holds state, not the pending logits, so at least one token is needed.
+    let state: QwenCPUModel.DecodeState
+    if let loadStatePath {
+        guard let persistable = model as? any PersistableInferenceModel else {
+            throw CLIError.statePersistenceUnavailable
+        }
+        let data = try Data(contentsOf: URL(fileURLWithPath: loadStatePath))
+        let info = try ConversationState.info(of: data)
+        state = try persistable.restoreState(from: data)
+        FileHandle.standardError.write(Data((
+            "loaded state: \(loadStatePath) (\(data.count) bytes, position \(state.position), "
+            + "written at capacity \(info.writerContextCapacity); this engine's capacity \(model.contextCapacity))\n"
+        ).utf8))
+    } else {
+        state = QwenCPUModel.DecodeState()
+    }
+    guard !ids.isEmpty else { throw CLIError.emptyPrompt }
+
     // Same admission as TextGenerator/SwiftletSession: the model rejects an
     // oversized prompt itself, but the output request must be clamped here or
-    // the loop below runs into the context limit mid-reply and throws.
+    // the loop below runs into the context limit mid-reply and throws. A
+    // loaded state has already consumed `state.position` tokens of the window.
     let admittedMaxNew = try ContextWindow(maximumTokens: model.contextCapacity)
-        .admittedMaxNew(processedTokens: 0, incomingTokens: ids.count, requestedMaxNew: maxNew)
+        .admittedMaxNew(processedTokens: state.position, incomingTokens: ids.count, requestedMaxNew: maxNew)
 
-    let state = QwenCPUModel.DecodeState()
     let prefillStart = Date()
     var logits = try model.step(ids, state: state)
     let prefillSecs = -prefillStart.timeIntervalSinceNow
@@ -361,6 +386,10 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
         format: "decode: %d tokens in %.1fs (%.2f tok/s)\n",
         generated.count, decodeSecs, Double(generated.count) / max(decodeSecs, 0.001)
     ).utf8))
+    // Raw ids, so a resumed run (--load-state --ids ...) can be compared
+    // token for token against an uninterrupted one.
+    FileHandle.standardError.write(Data(
+        "generated ids: \(generated.map(String.init).joined(separator: ","))\n".utf8))
     if model is QwenMetalModel {
         let gpu = gpuTimingSummary(
             seconds: decodeMetal.gpuExecutionSeconds,
@@ -391,6 +420,31 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
             Double(cache.budgetBytes) / 1_073_741_824,
             cache.hits, cache.misses, total > 0 ? 100 * Double(cache.hits) / Double(total) : 0
         ).utf8))
+    }
+    // --save-state writes the state as it stands after the last generated
+    // token was fed (prompt + every generated token).
+    if let saveStatePath {
+        guard let persistable = model as? any PersistableInferenceModel else {
+            throw CLIError.statePersistenceUnavailable
+        }
+        let data = try persistable.snapshot(of: state)
+        try data.write(to: URL(fileURLWithPath: saveStatePath), options: .atomic)
+        FileHandle.standardError.write(Data(
+            "saved state: \(saveStatePath) (\(data.count) bytes, position \(state.position))\n".utf8))
+    }
+}
+
+enum CLIError: Swift.Error, CustomStringConvertible {
+    case statePersistenceUnavailable
+    case emptyPrompt
+    case chatWithLoadedState
+
+    var description: String {
+        switch self {
+        case .statePersistenceUnavailable: return "this model cannot save or load state"
+        case .emptyPrompt: return "nothing to feed: give --prompt or --ids (a loaded state needs at least one new token)"
+        case .chatWithLoadedState: return "--chat cannot be combined with --load-state: a resumed sequence is continued with raw tokens, no template"
+        }
     }
 }
 
@@ -502,9 +556,12 @@ default:
     print("  swiftlet verify <model-dir> <fixtures.safetensors>   compare CPU forward vs mlx fixture")
     print("  swiftlet dump-tensor <model-dir> <module-path> <out.safetensors>   dequantized f32 weights of one module")
     print("  swiftlet generate <model-dir> --prompt \"...\" [--max-new 32] [--chat] [--gpu] [--cache-gb 8] [--prefill-chunk 32] [--lazy]")
+    print("                                [--save-state <file>] [--load-state <file>]")
     print("  swiftlet chat <model-dir> [\"turn\" ...] [--max-new 256] [--cache-gb 8] [--greedy] [--system \"...\"]")
     print("")
     print("  --gpu       Metal runtime; on a .qpack container experts stream through a bounded cache")
     print("  --cache-gb  expert cache budget, default 8 (note: swiftlet-server defaults to 2)")
     print("  --lazy      CPU path only: ~3 GB peak instead of ~10-14 GB, slower per step")
+    print("  --save-state  after generating, write the state (KV, DeltaNet recurrence, position) to <file>")
+    print("  --load-state  resume from <file>; --prompt/--ids are then fed as the continuation, raw tokens, no --chat (docs/STATE_FORMAT.md)")
 }
