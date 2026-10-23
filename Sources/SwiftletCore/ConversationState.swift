@@ -471,8 +471,15 @@ public enum ConversationState {
 
 /// What a snapshot names as its model. Cheap to compute (no weight bytes
 /// are read) and as strong as the container allows:
-///  - scheme 1, qpack container with hashes.json: SHA-256 over config.json
-///    and hashes.json, whose per-file SHA-256s pin every weight byte.
+///  - scheme 1, container with hashes.json: SHA-256 over config.json and
+///    hashes.json — the per-file SHA-256 manifest verify_container.py
+///    --write-hashes writes and StreamingInstaller verifies against,
+///    { "files": { "<relative path>": "<hex sha256>" } }; a manifest that
+///    lists every file (the script always does) pins every weight byte.
+///    hashes.json counts only when it decodes as that shape and lists at
+///    least one file, the installer's own test before it trusts the file;
+///    anything else is treated as absent, so a stray or broken file falls
+///    back to scheme 2 instead of pinning config.json plus some bytes.
 ///  - scheme 2, plain checkpoint (or a container without hashes.json):
 ///    SHA-256 over config.json, manifest.json if present, and each
 ///    safetensors shard's name, header JSON, and byte size. This pins the
@@ -492,7 +499,12 @@ struct ModelIdentity: Equatable {
         }
         feed("config.json", try Data(contentsOf: modelDir.appendingPathComponent("config.json")))
         let hashes = modelDir.appendingPathComponent("hashes.json")
-        if let hashBytes = try? Data(contentsOf: hashes) {
+        if let hashBytes = try? Data(contentsOf: hashes),
+           let manifest = try? JSONDecoder().decode(StreamingInstaller.HashesFile.self, from: hashBytes),
+           !manifest.files.isEmpty {
+            // The decode only selects the scheme; the digest is over the
+            // bytes as written, so the same table re-encoded is another
+            // identity.
             feed("hashes.json", hashBytes)
             return ModelIdentity(scheme: 1, digest: Array(hasher.finalize()))
         }

@@ -205,4 +205,47 @@ import Testing
         #expect(try copy.identity() == original)
         #expect(try copy.cpu().restoreState(from: data).position == ConversationStateTests.prompt.count)
     }
+
+    /// hashes.json selects scheme 1 only when it is a manifest the installer
+    /// would read — it decodes as { "files": { path: hex } } and lists at
+    /// least one file, StreamingInstaller's own test before it trusts the
+    /// file. Anything else is treated as no hashes.json: scheme 2 with the
+    /// plain directory's digest, so a stray or broken file can never shrink
+    /// the identity to "config.json plus some bytes".
+    @Test func hashesJSONTheInstallerWouldNotReadIsNotSchemeOne() throws {
+        let copy = try ModelCopy()
+        let plain = try copy.identity()
+        let shardHex = try #require(try copy.installerManifest()["model.safetensors"])
+        let rejected: [(String, Data)] = try [
+            ("not JSON", Data("\(shardHex)  model.safetensors\n".utf8)),
+            ("no files key", JSONSerialization.data(withJSONObject: ["model.safetensors": shardHex])),
+            ("empty files", JSONSerialization.data(withJSONObject: ["files": [String: String]()])),
+            ("non-string digest", JSONSerialization.data(withJSONObject: ["files": ["model.safetensors": 1]])),
+            ("empty file", Data()),
+        ]
+        for (label, bytes) in rejected {
+            try copy.writeHashes(bytes)
+            let id = try copy.identity()
+            #expect(id.scheme == 2, "\(label): hashes.json selected scheme \(id.scheme)")
+            #expect(id == plain, "\(label): identity differs from the directory without hashes.json")
+        }
+        // Positive control: the smallest manifest the installer reads.
+        try copy.writeHashes(["model.safetensors": shardHex])
+        let manifest = try copy.identity()
+        #expect(manifest.scheme == 1, "a one-entry manifest did not select scheme 1")
+        #expect(manifest.digest != plain.digest)
+
+        // End to end: a snapshot from a plain directory restores under a
+        // rejected file (same identity) and is refused once the file is a
+        // manifest.
+        let plainCopy = try ModelCopy()
+        let data = try Self.snapshotAfterPrompt(try plainCopy.cpu())
+        try copy.writeHashes(Data("not JSON".utf8))
+        #expect(try copy.cpu().restoreState(from: data).position == ConversationStateTests.prompt.count)
+        try copy.writeHashes(["model.safetensors": shardHex])
+        #expect(try copy.identity() == manifest)
+        #expect(throws: ConversationStateError.modelMismatch(expected: manifest.hex, found: plain.hex)) {
+            _ = try copy.cpu().restoreState(from: data)
+        }
+    }
 }

@@ -97,9 +97,20 @@ Snapshots must never be restored into a different model. The identity is a
 SHA-256 that reads no weight bytes, so it is cheap on an 18 GB container, and
 is as strong as the container allows:
 
-- **scheme 1 — qpack container with `hashes.json`**: digest over `config.json`
-  and `hashes.json`. `hashes.json` lists a SHA-256 per file in the container,
-  so this transitively pins every weight byte.
+- **scheme 1 — container with `hashes.json`**: digest over `config.json` and
+  `hashes.json`. `hashes.json` is the per-file SHA-256 manifest
+  `scripts/verify_container.py --write-hashes` writes and the streaming
+  installer verifies downloads against —
+  `{ "files": { "<relative path>": "<hex sha256>", … } }` — and a manifest
+  that lists every file in the container (the script always does)
+  transitively pins every weight byte. The file selects this scheme only
+  when it decodes as that shape and lists at least one file, the same test
+  the installer applies before it trusts the file; a `hashes.json` that
+  fails it is treated as absent (scheme 2), so a stray or broken file can
+  never shrink the identity to `config.json` plus some bytes. The digest is
+  over the file's bytes as they are on disk, not over the parsed table: the
+  parse only chooses the scheme, and the same table re-encoded is another
+  identity.
 - **scheme 2 — plain checkpoint, or a container without `hashes.json`**:
   digest over `config.json`, `manifest.json` if present, and for each
   safetensors shard (sorted by name) its file name, header JSON, and byte
@@ -264,6 +275,16 @@ process (open, fast path, decode) and peak RSS from `/usr/bin/time -l`:
   difference; two containers with identical structure and different weight
   values would share a scheme-2 identity, and that case is not exercised
   here.
-- Identity scheme 1 (`hashes.json`) was not exercised: neither container on
-  the box ships a `hashes.json`, nor does any fixture, so the scheme-1 arm
-  of `ModelIdentity.compute` has no test yet.
+- Identity scheme 1 (`hashes.json`) is exercised by `ModelIdentitySchemeTests`
+  on a copy of `fixtures/tiny-model-q4` carrying a `hashes.json` built at
+  test time in the installer's shape (see "Model identity"): scheme and
+  digest against the same files without the manifest, the digest's
+  construction, a bitwise round trip under scheme 1 on the CPU engine,
+  `modelMismatch` in both directions between the hashed and the plain
+  directory (CPU and Metal), one edited digest, and the installer's accept
+  rule for the file. No production container with a `hashes.json` has been
+  run under scheme 1: neither container on the gate box ships one, and the
+  installer does not write one into an installed container (it reads the
+  mirror's copy for verification only) — a scheme-1 identity arises for a
+  container downloaded whole or hashed locally with
+  `verify_container.py --write-hashes`.
