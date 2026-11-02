@@ -250,6 +250,12 @@ public final class StreamingInstaller {
             }
         }
 
+        // Every shard header is in hand and no weight byte has been fetched:
+        // refuse a tensor the affine layout has no place for (an nvfp4 global
+        // scale, a Hadamard sign vector) by name now, as `Checkpoint` does at
+        // open, rather than stream a container with the tensor dropped.
+        try Checkpoint.checkQuantTensors(names: all.map { $0.name })
+
         func isExpert(_ n: String) -> Bool { n.contains(".mlp.switch_mlp.") }
         func isSkipped(_ n: String) -> Bool {
             n.hasPrefix("vision_tower.") || n.contains("model.visual") || n.hasPrefix("mtp.") || n.contains(".mtp.")

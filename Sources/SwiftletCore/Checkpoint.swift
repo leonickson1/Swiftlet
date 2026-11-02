@@ -34,6 +34,13 @@ public final class Checkpoint {
         /// Its packed layout cannot be dequantized as affine, so the checkpoint
         /// is refused before any tensor is read.
         case unsupportedQuantMode(mode: String, module: String)
+        /// A module declared affine carries a quantization tensor that affine
+        /// dequantization has no use for: `key` is the full tensor name,
+        /// `module` the module it belongs to, `meaning` what the tensor is
+        /// (`Checkpoint.foreignQuantTensors`). Reading the module as plain
+        /// affine would drop the tensor and produce wrong weights with no
+        /// error, so the checkpoint is refused before any weight byte is read.
+        case unexpectedQuantTensor(key: String, module: String, meaning: String)
         /// `dir` has no `config.json`, so it is not a checkpoint directory (nor
         /// a qpack container, which carries a copy). Refused at open: before
         /// this the absent file read as an empty config, the directory opened
@@ -57,6 +64,10 @@ public final class Checkpoint {
             case .unsupportedQuantMode(let mode, let module):
                 return "unsupported MLX quantization mode \"\(mode)\" (\(module)); "
                     + "only \"\(Checkpoint.affineMode)\" checkpoints (packed weight + scales + biases) can be read"
+            case .unexpectedQuantTensor(let key, let module, let meaning):
+                return "unexpected quantization tensor \"\(key)\" beside the affine weights of \(module): "
+                    + "\(meaning); dequantizing the module as plain affine would silently drop it, "
+                    + "and only \"\(Checkpoint.affineMode)\" checkpoints (packed weight + scales + biases) can be read"
             }
         }
     }
@@ -106,6 +117,48 @@ public final class Checkpoint {
             throw Error.unsupportedQuantMode(mode: spec.mode, module: module)
         }
         return (defQuant, overrides)
+    }
+
+    /// Quantization tensors that are not part of the affine layout (weight +
+    /// scales + biases), keyed by the suffix mlx-lm stores them under, with
+    /// what each one is. Every mode other than affine is already refused by
+    /// name from `config.json`; these catch a checkpoint whose config says
+    /// affine while its weights carry a tensor only another layout uses, which
+    /// `quantization(fromConfig:)` cannot see. A repacker or installer that
+    /// copied the module as plain affine would drop the tensor and ship wrong
+    /// weights without an error, so the tensor is refused by name instead.
+    ///
+    /// - `global_scale`: mlx-lm's nvfp4 per-expert tensor scale on switch
+    ///   layers (mlx-lm `3696eb2`, "Add global scale for nvfp4 quantized
+    ///   MoEs"): `mx.quantize(..., mode="nvfp4", global_scale=...)` stores a
+    ///   `<module>.global_scale` tensor next to `.weight`/`.scales`.
+    /// - `signs`: the sign vector of a Hadamard rotation folded into a packed
+    ///   module's input axis (mlx-lm `05b7aed`, `prism_hadamard_qwen35`): the
+    ///   2-bit affine words are only meaningful after `mx.hadamard_transform`
+    ///   of the activations with `<module>.signs`.
+    public static let foreignQuantTensors: [(suffix: String, meaning: String)] = [
+        ("global_scale", "an nvfp4 per-expert global scale (mlx-lm `mode: nvfp4` with `global_scale`)"),
+        ("signs", "a Hadamard rotation sign vector (mlx-lm `prism_hadamard_qwen35`, Hadamard-rotated 2-bit)"),
+    ]
+
+    /// Refuses, by tensor and module name, the first tensor in `names` that is
+    /// one of `foreignQuantTensors`. Decided from the safetensors headers
+    /// alone: `init` runs it after mapping the shard headers and before any
+    /// tensor is read, and the streaming installer runs it over the headers it
+    /// has fetched before the first weight byte, so both producers refuse the
+    /// same checkpoint the same way.
+    public static func checkQuantTensors<S: Sequence>(names: S) throws where S.Element == String {
+        var found: [(key: String, module: String, meaning: String)] = []
+        for name in names {
+            for entry in foreignQuantTensors where name.hasSuffix("." + entry.suffix) {
+                let module = String(name.dropLast(entry.suffix.count + 1))
+                found.append((name, module, entry.meaning))
+            }
+        }
+        // Deterministic: the same checkpoint names the same tensor every time.
+        if let first = found.min(by: { $0.key < $1.key }) {
+            throw Error.unexpectedQuantTensor(key: first.key, module: first.module, meaning: first.meaning)
+        }
     }
 
     /// Reads a directory's `config.json` as a JSON object, refusing an absent
@@ -163,6 +216,10 @@ public final class Checkpoint {
             fileURLs.append(url)
             for name in files[0].tensors.keys { tensorToFile[name] = 0 }
         }
+        // The headers are mapped and no tensor has been read yet: refuse a
+        // quantization tensor the affine layout has no place for, by name,
+        // before a caller dequantizes the module around it.
+        try Self.checkQuantTensors(names: tensorToFile.keys)
     }
 
     /// Multimodal checkpoints (qwen3_5_moe) prefix text weights with
