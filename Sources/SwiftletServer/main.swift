@@ -210,6 +210,81 @@ final class ConnectionGenerationOwner: @unchecked Sendable {
     (try? JSONSerialization.data(withJSONObject: obj)) ?? Data("{}".utf8)
 }
 
+/// What this server will not read or run, decided from the request alone
+/// before the model is touched. Kept in a type rather than top-level `let`s:
+/// `main.swift` globals are not initialised when the module is imported by
+/// a test target, a `static let` is.
+enum RequestLimits {
+    /// Largest request body this server reads, in bytes. A chat request is
+    /// a few hundred KB at the most; the cap exists so a client cannot make
+    /// the server buffer an arbitrary body before `JSONDecoder` sees it.
+    /// The same figure strata chose for its serve path.
+    static let maxBodyBytes = 256 << 20
+    /// Generation budget when a request names neither `max_tokens` nor
+    /// `max_completion_tokens`.
+    static let defaultMaxNew = 512
+}
+
+/// A request refused at the server, before the model is touched, with the
+/// status to send and a message that names the field or header at fault.
+struct RequestRefusal: Swift.Error, CustomStringConvertible, Equatable {
+    let status: HTTPResponseStatus
+    let description: String
+}
+
+/// The generation budget a chat request asks for. `max_tokens` wins over
+/// `max_completion_tokens` as before; zero or a negative value in either is
+/// refused by the field's name. Before this, `max_tokens: 0` ran the prompt
+/// through prefill and returned an empty completion with `finish_reason:
+/// "length"`, and a negative value reached `ContextWindow`, whose refusal
+/// named `requestedMaxNew` (an internal parameter) after the prompt had been
+/// rendered and, on a streaming request, after the 200 head was on the wire.
+@Sendable func requestedMaxNew(_ request: ChatRequest) throws -> Int {
+    for (field, value) in [("max_tokens", request.max_tokens),
+                           ("max_completion_tokens", request.max_completion_tokens)] {
+        if let value, value <= 0 {
+            throw RequestRefusal(
+                status: .badRequest,
+                description: "\(field) must be a positive integer, got \(value)")
+        }
+    }
+    return request.max_tokens ?? request.max_completion_tokens ?? RequestLimits.defaultMaxNew
+}
+
+/// Decided from the request head alone, before any body byte is read: a
+/// `Content-Length` over the limit is 413, one that is not a non-negative
+/// integer is 400. (NIO's `HTTPServerProtocolErrorHandler`, installed by
+/// `configureHTTPServerPipeline()`, already answers an unparsable
+/// `Content-Length` with a bare 400 and closes before the head reaches this
+/// handler; the rule is kept here so the limit and its spellings live in one
+/// testable place.) No header means a chunked or empty body, which
+/// `bodyLimitRefusal` bounds as it arrives.
+@Sendable func requestBodyRefusal(contentLength: String?, limit: Int = RequestLimits.maxBodyBytes)
+    -> RequestRefusal? {
+    guard let contentLength else { return nil }
+    guard let declared = Int(contentLength.trimmingCharacters(in: .whitespaces)), declared >= 0 else {
+        return RequestRefusal(
+            status: .badRequest,
+            description: "malformed Content-Length \"\(contentLength)\"")
+    }
+    guard declared <= limit else {
+        return RequestRefusal(
+            status: .payloadTooLarge,
+            description: "Content-Length \(declared) exceeds this server's request body limit of \(limit) bytes")
+    }
+    return nil
+}
+
+/// The same bound applied as body chunks arrive (chunked transfer carries no
+/// `Content-Length`), so a request that declared nothing cannot grow past it.
+@Sendable func bodyLimitRefusal(accumulated: Int, incoming: Int, limit: Int = RequestLimits.maxBodyBytes)
+    -> RequestRefusal? {
+    guard accumulated + incoming > limit else { return nil }
+    return RequestRefusal(
+        status: .payloadTooLarge,
+        description: "request body exceeds this server's limit of \(limit) bytes")
+}
+
 /// `model` defaults to the served model's name. Tests pass it explicitly:
 /// top-level `main.swift` globals are not initialised when the executable
 /// module is imported by a test target, so reading `modelName` there yields a
@@ -267,6 +342,10 @@ final class HTTPHandler: ChannelInboundHandler {
 
     private var requestHead: HTTPRequestHead?
     private var body = ByteBuffer()
+    /// Set once a request has been refused from its head or its body size:
+    /// the rest of that request's parts are dropped, the refusal is on the
+    /// wire and the connection closes behind it.
+    private var refused = false
     private let generationOwner = ConnectionGenerationOwner()
 
     func channelInactive(context: ChannelHandlerContext) {
@@ -282,15 +361,40 @@ final class HTTPHandler: ChannelInboundHandler {
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         switch unwrapInboundIn(data) {
         case .head(let head):
-            requestHead = head
+            // Once refused, the connection is closing: nothing further on
+            // it is read, including a pipelined request behind the refusal.
+            guard !refused else { return }
             body = ByteBuffer()
+            if let refusal = requestBodyRefusal(contentLength: head.headers.first(name: "Content-Length")) {
+                requestHead = nil
+                refuse(context, refusal)
+                return
+            }
+            requestHead = head
         case .body(var chunk):
+            guard !refused else { return }
+            if let refusal = bodyLimitRefusal(accumulated: body.readableBytes, incoming: chunk.readableBytes) {
+                requestHead = nil
+                body = ByteBuffer()
+                refuse(context, refusal)
+                return
+            }
             body.writeBuffer(&chunk)
         case .end:
-            guard let head = requestHead else { return }
+            guard !refused, let head = requestHead else { return }
             route(context: context, head: head, body: body)
             requestHead = nil
         }
+    }
+
+    /// Answers a refusal decided before the body was read (or while it was
+    /// arriving) and closes the connection once the answer has been flushed:
+    /// the client may still be sending the body it was refused for, and
+    /// reading it to the end only to discard it is what the limit prevents.
+    private func refuse(_ context: ChannelHandlerContext, _ refusal: RequestRefusal) {
+        refused = true
+        respondJSON(context, status: refusal.status,
+                    data: jsonData(["error": refusal.description]), closeAfterFlush: true)
     }
 
     private func route(context: ChannelHandlerContext, head: HTTPRequestHead, body: ByteBuffer) {
@@ -323,7 +427,19 @@ final class HTTPHandler: ChannelInboundHandler {
             return
         }
         let messages = request.messages.map { ["role": $0.role, "content": $0.content.text] }
-        let maxNew = request.max_tokens ?? request.max_completion_tokens ?? 512
+        let maxNew: Int
+        do {
+            maxNew = try requestedMaxNew(request)
+        } catch let refusal as RequestRefusal {
+            // Decided here, before the prompt is rendered or queued behind
+            // another generation, so a streaming request gets a real 400
+            // rather than an error event after a 200 head.
+            respondJSON(context, status: refusal.status, data: jsonData(["error": refusal.description]))
+            return
+        } catch {
+            respondJSON(context, status: .badRequest, data: jsonData(["error": "malformed request"]))
+            return
+        }
         let streaming = request.stream ?? false
         let id = "chatcmpl-\(UUID().uuidString.prefix(8))"
         let eventLoop = context.eventLoop
@@ -537,15 +653,24 @@ final class HTTPHandler: ChannelInboundHandler {
         }
     }
 
-    private func respondJSON(_ context: ChannelHandlerContext, status: HTTPResponseStatus, data: Data) {
+    private func respondJSON(_ context: ChannelHandlerContext, status: HTTPResponseStatus, data: Data,
+                             closeAfterFlush: Bool = false) {
         var head = HTTPResponseHead(version: .http1_1, status: status)
         head.headers.add(name: "Content-Type", value: "application/json")
         head.headers.add(name: "Content-Length", value: String(data.count))
+        if closeAfterFlush { head.headers.add(name: "Connection", value: "close") }
         var buf = context.channel.allocator.buffer(capacity: data.count)
         buf.writeBytes(data)
         context.write(wrapOutboundOut(.head(head)), promise: nil)
         context.write(wrapOutboundOut(.body(.byteBuffer(buf))), promise: nil)
-        context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)
+        if closeAfterFlush {
+            let channel = context.channel
+            context.writeAndFlush(wrapOutboundOut(.end(nil))).whenComplete { _ in
+                channel.close(promise: nil)
+            }
+        } else {
+            context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)
+        }
     }
 }
 

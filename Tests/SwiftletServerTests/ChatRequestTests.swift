@@ -223,4 +223,84 @@ import SwiftletCore
             _ = try decode(#"{"messages":[{"role":"user","content":42}]}"#)
         }
     }
+
+    // MARK: request limits, decided before the model is touched
+
+    /// `max_tokens: 0` is refused by the field's name. mlx-lm's server
+    /// accepted 0 and let the generator reject it (mlx-lm `bacd9e8`); here it
+    /// ran prefill and returned an empty completion. A negative value is
+    /// refused the same way; before this it reached `ContextWindow`, whose
+    /// error named an internal parameter.
+    @Test func zeroOrNegativeMaxTokensIsRefusedByName() throws {
+        for (json, field, value) in [
+            (#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":0}"#, "max_tokens", 0),
+            (#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":-5}"#, "max_tokens", -5),
+            (#"{"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":0}"#, "max_completion_tokens", 0),
+            (#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":0,"max_completion_tokens":8}"#, "max_tokens", 0),
+            (#"{"messages":[{"role":"user","content":"hi"}],"max_tokens":8,"max_completion_tokens":-1}"#, "max_completion_tokens", -1),
+        ] {
+            let request = try decode(json)
+            do {
+                let n = try requestedMaxNew(request)
+                Issue.record("\(field)=\(value) was admitted as a budget of \(n)")
+            } catch let refusal as RequestRefusal {
+                #expect(refusal.status == .badRequest)
+                #expect(refusal.description.hasPrefix(field + " "), "the refusal must name the field: \(refusal)")
+                #expect(refusal.description.contains("got \(value)"))
+            }
+        }
+    }
+
+    /// The unchanged acceptance: a positive budget passes through, the
+    /// `max_tokens` spelling wins over `max_completion_tokens`, and a request
+    /// naming neither gets the default.
+    @Test func positiveMaxTokensIsAdmittedAsBefore() throws {
+        #expect(try requestedMaxNew(decode(#"{"messages":[],"max_tokens":7}"#)) == 7)
+        #expect(try requestedMaxNew(decode(#"{"messages":[],"max_completion_tokens":9}"#)) == 9)
+        #expect(try requestedMaxNew(decode(#"{"messages":[],"max_tokens":7,"max_completion_tokens":9}"#)) == 7)
+        #expect(try requestedMaxNew(decode(#"{"messages":[]}"#)) == RequestLimits.defaultMaxNew)
+        #expect(RequestLimits.defaultMaxNew == 512, "the default budget is unchanged")
+    }
+
+    /// A `Content-Length` above the cap is refused from the head, before a
+    /// body byte is read, as 413 naming the header, the value and the limit.
+    /// At the cap it is admitted. A header that is not a non-negative integer
+    /// is 400 naming the header; no header is not a refusal (chunked bodies
+    /// are bounded as they arrive).
+    @Test func contentLengthIsDecidedFromTheHead() {
+        let limit = RequestLimits.maxBodyBytes
+        #expect(limit == 256 << 20)
+        #expect(requestBodyRefusal(contentLength: nil) == nil)
+        #expect(requestBodyRefusal(contentLength: "0") == nil)
+        #expect(requestBodyRefusal(contentLength: "\(limit)") == nil)
+        #expect(requestBodyRefusal(contentLength: " 42 ") == nil)
+
+        let over = requestBodyRefusal(contentLength: "\(limit + 1)")
+        #expect(over?.status == .payloadTooLarge)
+        #expect(over?.description.contains("Content-Length \(limit + 1)") == true)
+        #expect(over?.description.contains("\(limit) bytes") == true)
+
+        for bad in ["abc", "-1", "1e9", "", "12abc"] {
+            let refusal = requestBodyRefusal(contentLength: bad)
+            #expect(refusal?.status == .badRequest, "Content-Length \"\(bad)\" must be refused")
+            #expect(refusal?.description.contains("Content-Length") == true)
+            #expect(refusal?.description.contains("\"\(bad)\"") == true)
+        }
+        // A smaller limit is honoured, so the cap is one number in one place.
+        #expect(requestBodyRefusal(contentLength: "11", limit: 10)?.status == .payloadTooLarge)
+        #expect(requestBodyRefusal(contentLength: "10", limit: 10) == nil)
+    }
+
+    /// A body that declared no length is bounded chunk by chunk: the chunk
+    /// that would carry the total past the limit is refused as 413.
+    @Test func chunkedBodyIsBoundedAsItArrives() {
+        let limit = RequestLimits.maxBodyBytes
+        #expect(bodyLimitRefusal(accumulated: 0, incoming: limit) == nil)
+        #expect(bodyLimitRefusal(accumulated: limit - 1, incoming: 1) == nil)
+        let over = bodyLimitRefusal(accumulated: limit - 1, incoming: 2)
+        #expect(over?.status == .payloadTooLarge)
+        #expect(over?.description.contains("\(limit) bytes") == true)
+        #expect(bodyLimitRefusal(accumulated: 5, incoming: 6, limit: 10)?.status == .payloadTooLarge)
+        #expect(bodyLimitRefusal(accumulated: 5, incoming: 5, limit: 10) == nil)
+    }
 }
