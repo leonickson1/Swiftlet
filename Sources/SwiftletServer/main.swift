@@ -118,6 +118,14 @@ FileHandle.standardError.write(Data("loading model + tokenizer...\n".utf8))
 // (The CPU model reader cannot serve containers: their experts are not in
 // model.safetensors.)
 let session = try await SwiftletSession(modelDir: modelURL, cacheBudgetGB: cacheGB)
+// OS memory pressure: warning/critical shrink the expert cache to the valve,
+// normal restores --cache-gb. The monitor must outlive every request, so it
+// is a top-level global like the session.
+let memoryPressureMonitor = session.makeMemoryPressureMonitor()
+FileHandle.standardError.write(Data(String(
+    format: "memory-pressure source registered (warning/critical shrink the expert cache to %.2f GB, normal restores %.2f GB)\n",
+    min(SwiftletSession.pressureShrinkGB, session.cacheBudgetGB), session.cacheBudgetGB
+).utf8))
 let modelName: String = {
     let configURL = modelURL.appendingPathComponent("config.json")
     if let cfg = try? JSONSerialization.jsonObject(with: Data(contentsOf: configURL)) as? [String: Any],

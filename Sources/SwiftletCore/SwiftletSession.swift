@@ -84,6 +84,8 @@ public final class SwiftletSession: @unchecked Sendable {
     /// expert cache (keep small on iOS; jetsam is unforgiving).
     public init(modelDir: URL, retainAllLayers: Bool = false, cacheBudgetGB: Double = 2) async throws {
         self.modelDir = modelDir
+        self.cacheBudgetGB = cacheBudgetGB
+        self.appliedCacheBudgetGB = cacheBudgetGB
         print("[SwiftletSession] loading tokenizer...")
         let tokenizer = try await AutoTokenizer.from(modelFolder: modelDir)
         encodeText = { tokenizer.encode(text: $0) }
@@ -154,9 +156,12 @@ public final class SwiftletSession: @unchecked Sendable {
         renderMessages: @escaping ([[String: String]]) throws -> [Int],
         suppressedIds: Set<Int> = [],
         usesThinkPrompt: Bool = false,
-        generationCleanupHook: (() -> Void)? = nil
+        generationCleanupHook: (() -> Void)? = nil,
+        cacheBudgetGB: Double = 2
     ) {
         self.modelDir = modelDir
+        self.cacheBudgetGB = cacheBudgetGB
+        self.appliedCacheBudgetGB = cacheBudgetGB
         self.model = model
         self.config = model.config
         self.generator = TextGenerator(model: model)
@@ -226,38 +231,110 @@ public final class SwiftletSession: @unchecked Sendable {
         genLock.unlock()
     }
     private var generationActive = false
-    private var pendingShrinkGB: Double?
+    /// The cache budget the decode thread must apply between tokens, when a
+    /// pressure event landed mid-generation. Guarded by `genLock`; the
+    /// latest event wins, so a normal that follows a queued warning cancels
+    /// the shrink instead of tearing the cache down and rebuilding it.
+    private var pendingBudgetGB: Double?
     /// Conversation state and the underlying model are both mutable. This is
     /// the session's single-flight boundary for every public streamChat call.
     private let generationQueue = DispatchQueue(
         label: "swiftlet.session.generation", qos: .userInitiated
     )
 
-    /// Frees most of the expert cache in response to OS memory pressure; it
-    /// refills lazily as generation continues. Safe to call from any thread.
-    public func handleMemoryPressure() {
+    /// The expert-cache budget this session was configured with (`--cache-gb`
+    /// on the CLI and server), what a return to normal pressure restores.
+    public let cacheBudgetGB: Double
+    /// The budget the expert cache runs at now: `cacheBudgetGB`, or the
+    /// pressure valve after a warning. Guarded by `genLock`.
+    private var appliedCacheBudgetGB: Double
+    /// What warning and critical pressure shrink the cache to; the cache
+    /// refills lazily as generation continues.
+    public static let pressureShrinkGB = 0.4
+
+    public var currentCacheBudgetGB: Double {
         genLock.lock()
-        if generationActive {
-            pendingShrinkGB = 0.4
-            genLock.unlock()
-            print("[SwiftletSession] memory pressure: shrink deferred to between tokens")
-        } else {
-            defer { genLock.unlock() }
-            (model as? QwenMetalModel)?.shrinkCache(toGB: 0.4)
-            print("[SwiftletSession] memory pressure: cache shrunk (idle)")
+        defer { genLock.unlock() }
+        return appliedCacheBudgetGB
+    }
+
+    /// The budget `level` asks for: the valve under pressure (never above
+    /// the configured budget), the configured budget when pressure lifts.
+    private func cacheBudget(for level: MemoryPressureLevel) -> Double {
+        switch level {
+        case .warning, .critical: return min(Self.pressureShrinkGB, cacheBudgetGB)
+        case .normal: return cacheBudgetGB
         }
     }
 
-    /// Applies a deferred pressure shrink; called on the decode thread
-    /// between model steps, when no step is in flight.
-    private func applyPendingShrink() {
+    private func resizeExpertCache(toGB gb: Double) {
+        (model as? ExpertCacheResizing)?.resizeExpertCache(toGB: gb)
+    }
+
+    /// Reacts to OS memory pressure: `.warning` and `.critical` free most of
+    /// the expert cache (it refills lazily as generation continues), `.normal`
+    /// restores the configured budget. A level whose target the cache already
+    /// runs at does nothing -- rebuilding drops every resident expert. Safe
+    /// to call from any thread; the zero-argument form is a warning, as the
+    /// iOS host has always called it.
+    public func handleMemoryPressure(_ level: MemoryPressureLevel = .warning) {
+        let target = cacheBudget(for: level)
         genLock.lock()
-        let gb = pendingShrinkGB
-        pendingShrinkGB = nil
+        if generationActive {
+            pendingBudgetGB = target == appliedCacheBudgetGB ? nil : target
+            let queued = pendingBudgetGB != nil
+            genLock.unlock()
+            if queued {
+                print("[SwiftletSession] memory pressure \(Self.describe(level)): cache budget "
+                      + "\(Self.gb(target)) deferred to between tokens")
+            } else {
+                print("[SwiftletSession] memory pressure \(Self.describe(level)): nothing queued (cache already at its target)")
+            }
+            return
+        }
+        // Idle: resize under the lock, so a generation that arrives now waits
+        // in beginGeneration() instead of stepping on a cache being replaced.
+        defer { genLock.unlock() }
+        guard target != appliedCacheBudgetGB else { return }
+        appliedCacheBudgetGB = target
+        resizeExpertCache(toGB: target)
+        print("[SwiftletSession] memory pressure \(Self.describe(level)): cache budget "
+              + "\(level == .normal ? "restored to" : "shrunk to") \(Self.gb(target)) (idle)")
+    }
+
+    private static func gb(_ value: Double) -> String {
+        String(format: "%.2f GB", value)
+    }
+
+    private static func describe(_ level: MemoryPressureLevel) -> String {
+        switch level {
+        case .warning: return "warning"
+        case .critical: return "critical"
+        case .normal: return "normal"
+        }
+    }
+
+    /// Applies a deferred pressure budget; called on the decode thread
+    /// between model steps, when no step is in flight.
+    private func applyPendingBudget() {
+        genLock.lock()
+        let gb = pendingBudgetGB
+        pendingBudgetGB = nil
+        if let gb { appliedCacheBudgetGB = gb }
         genLock.unlock()
         if let gb {
-            (model as? QwenMetalModel)?.shrinkCache(toGB: gb)
-            print("[SwiftletSession] deferred cache shrink applied")
+            resizeExpertCache(toGB: gb)
+            print("[SwiftletSession] deferred cache budget applied: \(Self.gb(gb))")
+        }
+    }
+
+    /// Wires this session to the OS memory-pressure source. The caller keeps
+    /// the returned monitor alive for as long as the session serves.
+    public func makeMemoryPressureMonitor(
+        queue: DispatchQueue = DispatchQueue(label: "swiftlet.session.memory-pressure", qos: .utility)
+    ) -> MemoryPressureMonitor {
+        MemoryPressureMonitor(queue: queue) { [weak self] level in
+            self?.handleMemoryPressure(level)
         }
     }
 
@@ -276,15 +353,16 @@ public final class SwiftletSession: @unchecked Sendable {
         // pass instead of invoking shrinkCache concurrently.
         while true {
             genLock.lock()
-            guard let gb = pendingShrinkGB else {
+            guard let gb = pendingBudgetGB else {
                 generationActive = false
                 genLock.unlock()
                 break
             }
-            pendingShrinkGB = nil
+            pendingBudgetGB = nil
+            appliedCacheBudgetGB = gb
             genLock.unlock()
-            (model as? QwenMetalModel)?.shrinkCache(toGB: gb)
-            print("[SwiftletSession] deferred cache shrink applied")
+            resizeExpertCache(toGB: gb)
+            print("[SwiftletSession] deferred cache budget applied: \(Self.gb(gb))")
         }
         generationCleanupHook?()
     }
@@ -508,7 +586,7 @@ public final class SwiftletSession: @unchecked Sendable {
 
                         for _ in 0..<admittedMaxNew {
                             try checkGenerationCancellation { control.isCancelled }
-                            self.applyPendingShrink()
+                            self.applyPendingBudget()
                             try checkGenerationCancellation { control.isCancelled }
                             // EOS is legal when the reply reads finished (ends
                             // at a sentence or line break) OR EOS is the model's

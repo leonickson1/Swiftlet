@@ -587,9 +587,11 @@ public final class QwenMetalModel {
         }
     }
 
-    /// Replaces the expert cache with a smaller one (old slots free
-    /// immediately; the new cache refills lazily). Memory-pressure valve.
-    public func shrinkCache(toGB gb: Double) {
+    /// Replaces the expert cache with one bounded by `gb` (old slots free
+    /// immediately; the new cache refills lazily). The memory-pressure valve
+    /// in both directions: the session shrinks here on a warning and restores
+    /// the configured budget here when pressure lifts.
+    public func resizeCache(toGB gb: Double) {
         guard expertCache != nil else { return }
         // Int(Double) traps on NaN, infinity, and out-of-range values; a
         // pressure valve must refuse such a request, not crash on it.
@@ -599,6 +601,12 @@ public final class QwenMetalModel {
             containerDir: ckpt.dir, device: engine.device, budgetBytes: budget
         ) else { return }
         expertCache = replacement
+    }
+
+    /// The original name of `resizeCache(toGB:)`, kept for callers that only
+    /// ever shrank.
+    public func shrinkCache(toGB gb: Double) {
+        resizeCache(toGB: gb)
     }
 
     // MARK: - GPU phase helper
