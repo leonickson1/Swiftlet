@@ -62,13 +62,26 @@ import Testing
         SwiftletSession(
             testingModel: model,
             modelDir: model.modelDir,
-            // Continuation turns: "short" renders to one token, anything else
-            // to four, so a caller can choose which side of the window it is on.
             encodeText: { text in text.contains("short") ? [30] : [30, 31, 32, 33] },
             decodeTokens: { tokens in
                 String(String.UnicodeScalarView(tokens.compactMap { Unicode.Scalar($0) }))
             },
-            renderMessages: { _ in [10, 11, 12] }
+            renderMessages: { messages in
+                // The transcript renders as the ids each turn was fed, so a
+                // continuation's render begins with what the state holds and
+                // the tail is the new turn: one token for "short", four
+                // otherwise, so a caller can choose which side of the window
+                // it is on.
+                var ids = [10, 11, 12]
+                for message in messages.dropFirst() {
+                    if message["role"] == "assistant" {
+                        ids += (message["content"] ?? "").unicodeScalars.map { Int($0.value) }
+                    } else {
+                        ids += (message["content"] ?? "").contains("short") ? [30] : [30, 31, 32, 33]
+                    }
+                }
+                return ids
+            }
         )
     }
 
