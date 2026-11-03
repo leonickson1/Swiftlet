@@ -12,7 +12,8 @@ import Tokenizers
 /// - `container`: the model directory is absent, incomplete or damaged
 ///   (no config, no tokenizer, a truncated blob, a bad shard).
 /// - `config`: `config.json` is present but refused by name
-///   (unknown `model_type`, a quantization mode this engine cannot read).
+///   (unknown `model_type`, a quantization mode or tensor this engine
+///   cannot read).
 /// - `resource`: the host cannot give what the model needs
 ///   (an expert cache budget too small for its working set, a KV
 ///   allocation refused, the port already taken).
@@ -75,7 +76,8 @@ public enum StartupFailure: Swift.Error, CustomStringConvertible, Equatable, Sen
             return .config(reason)
         case let checkpoint as Checkpoint.Error:
             switch checkpoint {
-            case .malformedConfig, .unsupportedQuantMode, .unsupportedBits:
+            case .malformedConfig, .unsupportedQuantMode, .unsupportedBits,
+                 .unexpectedQuantTensor:
                 return .config(reason)
             case .missingConfig, .missingTensor, .badShape:
                 return .container(reason)

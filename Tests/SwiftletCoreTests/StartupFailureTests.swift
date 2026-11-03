@@ -25,6 +25,11 @@ import Tokenizers
         #expect(kind(Checkpoint.Error.malformedConfig(path: "/m/config.json", reason: "not an object")) == "config")
         #expect(kind(Checkpoint.Error.unsupportedQuantMode(mode: "mxfp4", module: "quantization")) == "config")
         #expect(kind(Checkpoint.Error.unsupportedBits(3)) == "config")
+        #expect(kind(Checkpoint.Error.unexpectedQuantTensor(
+            key: "model.layers.0.mlp.switch_mlp.gate_proj.global_scale",
+            module: "model.layers.0.mlp.switch_mlp.gate_proj",
+            meaning: "an nvfp4 per-expert global scale"
+        )) == "config")
     }
 
     @Test func containerErrorsAreContainer() {
