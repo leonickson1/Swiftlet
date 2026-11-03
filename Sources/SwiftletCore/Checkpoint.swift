@@ -79,6 +79,8 @@ public final class Checkpoint {
 
     private var files: [SafetensorsFile] = []
     private var fileURLs: [URL] = []
+    /// The safetensors shards backing this checkpoint (model identity input).
+    var shardURLs: [URL] { fileURLs }
     private var tensorToFile: [String: Int] = [:]
 
     /// Parses mlx-lm's quantization block and refuses any mode this reader

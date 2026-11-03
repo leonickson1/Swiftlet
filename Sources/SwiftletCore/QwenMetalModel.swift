@@ -153,6 +153,10 @@ public final class QwenMetalModel {
         var gpuTimedCommandBuffers = 0
         var gpuUntimedCommandBuffers = 0
         var completedWithoutThrow = false
+        /// True from the first layer of a token (or chunk) until its
+        /// `position` advance: a throw in that window leaves the state
+        /// half-advanced (see DecodeState.tainted).
+        var stateMutatedMidToken = false
         var timeline: [CommandBufferSample] = []
         var phaseDispatches: [StepPhase: Int] = [:]
         var phaseEncodeSeconds: [StepPhase: Double] = [:]
@@ -339,7 +343,9 @@ public final class QwenMetalModel {
     var sBuf: MTLBuffer?
     var hBuf: MTLBuffer?
     var reg = Regions()
-    var boundStateID: ObjectIdentifier?
+    /// The state whose conv history and delta recurrence currently sit in
+    /// the fast path's per-layer GPU buffers (see bindState).
+    weak var boundState: QwenCPUModel.DecodeState?
     struct PendingMoE {
         var bufs: [MTLBuffer]
         var weights: [Float]
@@ -584,6 +590,15 @@ public final class QwenMetalModel {
                 // kCache/vCache grow on demand in ensureKVCapacity.
             }
             fastLayers.append(fl)
+        }
+    }
+
+    deinit {
+        // The bound state's live recurrence dies with these buffers: hand it
+        // back so the state stays usable on another engine or instance.
+        if let state = boundState {
+            if state.position > 0 { captureRecurrentState(into: state) }
+            state.boundOn = nil
         }
     }
 
@@ -989,24 +1004,35 @@ public final class QwenMetalModel {
             let wanted = min(max(1, chunkTokens), tokens.count)
             if ensurePrefillCapacity(wanted) { chunkCapacity = wanted }
         }
-        if chunkCapacity > 0 {
-            logits = try prefillLayerMajor(
-                tokens, state: state, chunkCapacity: chunkCapacity, shouldCancel: shouldCancel
-            )
-        } else {
-            for (index, t) in tokens.enumerated() {
-                try checkGenerationCancellation(shouldCancel)
-                // S1a LM-head elision: a multi-token call consumes only the
-                // final position's logits, so intermediate vocabulary
-                // projections are unnecessary.
-                let projectLogits = index == tokens.count - 1
-                logits = try stepOne(
-                    t, state: state, projectLogits: projectLogits, shouldCancel: shouldCancel
+        do {
+            if chunkCapacity > 0 {
+                logits = try prefillLayerMajor(
+                    tokens, state: state, chunkCapacity: chunkCapacity, shouldCancel: shouldCancel
                 )
-                state.position += 1
-                counters.tokensProcessed += 1
-                try checkGenerationCancellation(shouldCancel)
+            } else {
+                for (index, t) in tokens.enumerated() {
+                    try checkGenerationCancellation(shouldCancel)
+                    // S1a LM-head elision: a multi-token call consumes only the
+                    // final position's logits, so intermediate vocabulary
+                    // projections are unnecessary.
+                    let projectLogits = index == tokens.count - 1
+                    logits = try stepOne(
+                        t, state: state, projectLogits: projectLogits, shouldCancel: shouldCancel
+                    )
+                    state.position += 1
+                    counters.stateMutatedMidToken = false
+                    counters.tokensProcessed += 1
+                    try checkGenerationCancellation(shouldCancel)
+                }
             }
+        } catch {
+            // A throw after a layer's command buffer ran and before `position`
+            // advanced leaves the GPU recurrence, the KV mirror, and the
+            // position disagreeing. The state stays steppable on this instance
+            // (the caller is told to discard it); snapshotting it, or loading
+            // it into another instance's buffers, is refused.
+            if counters.stateMutatedMidToken { state.tainted = true }
+            throw error
         }
         counters.completedWithoutThrow = true
         return logits
@@ -1030,6 +1056,7 @@ public final class QwenMetalModel {
 
         for li in 0..<cfg.numHiddenLayers {
             try checkGenerationCancellation(shouldCancel)
+            activeStepCounters?.stateMutatedMidToken = true
             let layer = layers[li]
             var x = h
             QwenCPUModel.rmsNorm(&x, rows: 1, dim: D, weight: layer.inputNorm, eps: Float(cfg.rmsNormEps))
@@ -1467,7 +1494,7 @@ extension QwenMetalModel {
             count: n))
     }
 
-    private func resetGPUState() {
+    func resetGPUState() {
         for fl in fastLayers {
             if let h = fl.hist { memset(h.contents(), 0, h.length) }
             if let st = fl.state { memset(st.contents(), 0, st.length) }
@@ -1645,10 +1672,7 @@ extension QwenMetalModel {
     ) throws -> [Float] {
         let cfg = config
         let D = cfg.hiddenSize
-        if boundStateID != ObjectIdentifier(state) || state.position == 0 {
-            boundStateID = ObjectIdentifier(state)
-            if state.position == 0 { resetGPUState() }
-        }
+        try bindState(state)
 
         let h0 = try embeddingRow(token)
         h0.withUnsafeBufferPointer {
@@ -1660,6 +1684,7 @@ extension QwenMetalModel {
 
         for li in 0..<cfg.numHiddenLayers {
             try checkGenerationCancellation(shouldCancel)
+            activeStepCounters?.stateMutatedMidToken = true
             let L = layers[li]
             let fl = fastLayers[li]
 
@@ -1943,9 +1968,13 @@ extension QwenMetalModel {
     /// for attention, so the step surfaces the allocation failure.
     public enum RuntimeError: Swift.Error {
         case kvCacheAllocationFailed(layer: Int, rows: Int)
+        /// A `DecodeState` handed to the fast path cannot be loaded into the
+        /// GPU buffers: a field is missing or does not fit this model's
+        /// geometry for the state's position (see bindState / loadGPUState).
+        case inconsistentState(String)
     }
 
-    private var kvRowFloats: Int { config.numKeyValueHeads * config.headDim }
+    var kvRowFloats: Int { config.numKeyValueHeads * config.headDim }
 
     /// Grows layer `li`'s GPU KV cache to hold at least `rows` positions
     /// (doubling; written rows copied across). Only called between command
@@ -2265,10 +2294,7 @@ extension QwenMetalModel {
         let cfg = config
         let D = cfg.hiddenSize
         let S = chunk.count
-        if boundStateID != ObjectIdentifier(state) || state.position == 0 {
-            boundStateID = ObjectIdentifier(state)
-            if state.position == 0 { resetGPUState() }
-        }
+        try bindState(state)
         let basePosition = state.position
 
         for (t, token) in chunk.enumerated() {
@@ -2282,6 +2308,7 @@ extension QwenMetalModel {
         var pending: PendingChunkMoE?
 
         for li in 0..<cfg.numHiddenLayers {
+            activeStepCounters?.stateMutatedMidToken = true
             let L = layers[li]
             let fl = fastLayers[li]
 
@@ -2392,6 +2419,7 @@ extension QwenMetalModel {
         commitAndWait(cb)
 
         state.position += S
+        activeStepCounters?.stateMutatedMidToken = false
         activeStepCounters?.tokensProcessed += S
 
         guard projectLogits else { return [] }
