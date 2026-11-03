@@ -85,8 +85,10 @@ public final class StreamingInstaller {
 
     /// SHA-256 manifest published next to a packed container (`hashes.json`),
     /// the same file `scripts/verify_container.py --write-hashes` produces:
-    /// { "files": { "<relative path>": "<hex sha256>", ... } }.
-    private struct HashesFile: Decodable { let files: [String: String] }
+    /// { "files": { "<relative path>": "<hex sha256>", ... } }. Also the
+    /// shape `ModelIdentity.compute` requires before a hashes.json selects
+    /// identity scheme 1, so the two readers cannot disagree on it.
+    struct HashesFile: Decodable { let files: [String: String] }
 
     let source: Source
     let outputDir: URL
