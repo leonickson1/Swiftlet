@@ -204,6 +204,16 @@ public final class StreamingInstaller {
         // parsed block is kept: the manifest's expert quantization is resolved
         // from it once the shard headers say which modules are quantized.
         let configObject = (try JSONSerialization.jsonObject(with: configData) as? [String: Any]) ?? [:]
+        // Refuse a checkpoint quantized by Hugging Face / NVIDIA ModelOpt
+        // tooling rather than by mlx-lm now, by name, before anything is
+        // written here and before the shard plan: `config.json`'s
+        // `quantization_config` (top level or under `text_config`), else the
+        // sibling `hf_quant_config.json`, fetched beside `config.json` only
+        // when the config names no quantization at all (one small file, nil
+        // when the source has none). Same decision as Checkpoint's at open.
+        try Checkpoint.checkHFQuantization(config: configObject) {
+            Checkpoint.hfQuantConfig(from: try source.smallFile("hf_quant_config.json"))
+        }
         let quant = try Checkpoint.quantization(fromConfig: configObject)
         // Same for the family: a checkpoint of another model_type is refused
         // here, by name, before anything is written into the output directory.

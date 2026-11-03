@@ -49,6 +49,17 @@ public final class Checkpoint {
         case missingConfig(String)
         /// `config.json` exists but cannot be read as a JSON object.
         case malformedConfig(path: String, reason: String)
+        /// The checkpoint's quantization is declared by Hugging Face or NVIDIA
+        /// ModelOpt metadata and not by an mlx-lm `quantization` block:
+        /// `source` is where it was found (`config.json quantization_config`,
+        /// `config.json text_config.quantization_config` or a sibling
+        /// `hf_quant_config.json`, the three places mlx-lm reads it from) and
+        /// `algorithm` the `quant_method` / `quant_algo` it names (`unknown`
+        /// when it names neither). mlx-lm quantizes or dequantizes such a
+        /// checkpoint while loading it; this reader has no on-load quantizer,
+        /// so before this check the directory opened as plain unquantized
+        /// weights and failed later, on a tensor the error then blamed.
+        case hfQuantizedCheckpoint(source: String, algorithm: String)
 
         public var description: String {
             switch self {
@@ -59,6 +70,11 @@ public final class Checkpoint {
                     + "model.safetensors.index.json, and the tokenizer files; copy them from the source)"
             case .malformedConfig(let path, let reason):
                 return "config.json at \(path) is not a JSON object (\(reason))"
+            case .hfQuantizedCheckpoint(let source, let algorithm):
+                return "\(source) declares a Hugging Face / ModelOpt quantization (\(algorithm)) and config.json "
+                    + "has no mlx-lm \"quantization\" block: the weights are not in the mlx-lm affine layout "
+                    + "(packed weight + scales + biases) this reader dequantizes; convert the checkpoint with "
+                    + "mlx_lm.convert (python -m mlx_lm.convert --hf-path <dir-or-repo> -q) and open the result"
             case .unsupportedBits(let bits): return "unsupported \(bits)-bit quantization (affine 4- and 8-bit only)"
             case .badShape(let name): return "bad shape for tensor \(name)"
             case .unsupportedQuantMode(let mode, let module):
@@ -185,12 +201,95 @@ public final class Checkpoint {
         return cfg
     }
 
+    /// Hugging Face / NVIDIA ModelOpt quantization metadata, read from the
+    /// three places mlx-lm reads it from when it loads a checkpoint
+    /// (`mlx_lm/utils.py` `load_model`, since mlx-lm `3696eb2`), in its order:
+    /// `config.json`'s `quantization_config`, else
+    /// `text_config.quantization_config`, else a sibling `hf_quant_config.json`
+    /// ("NVIDIA ModelOpt exports keep their quantization metadata in a separate
+    /// file"), which `hfQuantConfig` is asked for only when neither key is
+    /// present. Returns the first source found and the algorithm it names, nil
+    /// when the checkpoint carries none. An empty object declares nothing, as
+    /// mlx-lm treats it.
+    public static func hfQuantization(fromConfig cfg: [String: Any],
+                                      hfQuantConfig: () throws -> [String: Any]?) throws
+        -> (source: String, algorithm: String)? {
+        if let q = cfg["quantization_config"] as? [String: Any], !q.isEmpty {
+            return ("config.json quantization_config", hfQuantAlgorithm(q))
+        }
+        if let text = cfg["text_config"] as? [String: Any],
+           let q = text["quantization_config"] as? [String: Any], !q.isEmpty {
+            return ("config.json text_config.quantization_config", hfQuantAlgorithm(q))
+        }
+        if let q = try hfQuantConfig() {
+            return ("hf_quant_config.json", hfQuantAlgorithm(q))
+        }
+        return nil
+    }
+
+    /// The algorithm an HF `quantization_config` or a ModelOpt
+    /// `hf_quant_config.json` object names: transformers' `quant_method`
+    /// (`fp8`, `awq`, `gptq`, `compressed-tensors`, `modelopt`, ...), ModelOpt's
+    /// `quant_algo` (`NVFP4`, `FP8`; at the top level, or under `quantization`
+    /// where the sidecar nests it). An object carrying both (a ModelOpt entry
+    /// embedded by transformers) is reported as `method/algo`; one carrying
+    /// neither as `unknown`.
+    static func hfQuantAlgorithm(_ object: [String: Any]) -> String {
+        let method = object["quant_method"] as? String
+        let algo = (object["quant_algo"] as? String)
+            ?? ((object["quantization"] as? [String: Any])?["quant_algo"] as? String)
+        switch (method, algo) {
+        case let (method?, algo?): return "\(method)/\(algo)"
+        case let (method?, nil): return method
+        case let (nil, algo?): return algo
+        case (nil, nil): return "unknown"
+        }
+    }
+
+    /// `hf_quant_config.json` parsed as a JSON object; nil for an absent file
+    /// (`data == nil`). A present but unreadable one still counts, as `[:]`
+    /// (algorithm `unknown`): mlx-lm keys on the file's existence.
+    public static func hfQuantConfig(from data: Data?) -> [String: Any]? {
+        guard let data else { return nil }
+        return ((try? JSONSerialization.jsonObject(with: data)) as? [String: Any]) ?? [:]
+    }
+
+    /// The sidecar beside a directory's `config.json`, nil when absent.
+    public static func readHFQuantConfig(inDirectory dir: URL) -> [String: Any]? {
+        hfQuantConfig(from: FileManager.default.contents(
+            atPath: dir.appendingPathComponent("hf_quant_config.json").path))
+    }
+
+    /// Refuses, by name, a checkpoint whose quantization is declared by
+    /// Hugging Face / ModelOpt metadata alone. Every entry point decides here
+    /// -- checkpoint open (so the repacker and both model loaders), and the
+    /// streaming installer before its shard plan -- and names the same source
+    /// and algorithm. A checkpoint that also carries an mlx-lm `quantization`
+    /// block is not refused: mlx-lm writes `quantization_config` as a copy of
+    /// `quantization` on every quantized convert (`save_config`), so the HF
+    /// key beside the block means "converted by mlx-lm", and the block's mode
+    /// is what `quantization(fromConfig:)` then decides. `hfQuantConfig` is
+    /// consulted only when it is needed (no block, neither config key), so an
+    /// ordinary install fetches nothing extra.
+    public static func checkHFQuantization(config cfg: [String: Any],
+                                           hfQuantConfig: () throws -> [String: Any]?) throws {
+        if (cfg["quantization"] as? [String: Any]) != nil { return }
+        if let found = try hfQuantization(fromConfig: cfg, hfQuantConfig: hfQuantConfig) {
+            throw Error.hfQuantizedCheckpoint(source: found.source, algorithm: found.algorithm)
+        }
+    }
+
     public init(dir: URL) throws {
         self.dir = dir
 
         // Refuses a directory that is not a checkpoint here, by name, before
         // any shard is looked for.
         let cfg = try Self.readConfig(inDirectory: dir)
+        // Refuses a checkpoint quantized by Hugging Face / ModelOpt tooling
+        // rather than by mlx-lm here, by name, before the mode is read and
+        // before any shard is looked for: with no `quantization` block it
+        // opened as plain unquantized weights.
+        try Self.checkHFQuantization(config: cfg) { Self.readHFQuantConfig(inDirectory: dir) }
         // Refuses a non-affine checkpoint here, before any shard is opened.
         let quant = try Self.quantization(fromConfig: cfg)
         defaultQuant = quant.default
