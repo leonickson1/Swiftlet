@@ -23,10 +23,14 @@ public final class SwiftletSession: @unchecked Sendable {
         /// prompt was prefilled, and `reason` says why.
         public var reusedTokens: Int
         public var reason: String
+        /// The prompt matched the saved answer-start state rather than the
+        /// live state, which may contain a differently rendered think block.
+        public var restoredSnapshot: Bool
         public var reused: Bool { reusedTokens > 0 }
-        public init(reusedTokens: Int = 0, reason: String = "") {
+        public init(reusedTokens: Int = 0, reason: String = "", restoredSnapshot: Bool = false) {
             self.reusedTokens = reusedTokens
             self.reason = reason
+            self.restoredSnapshot = restoredSnapshot
         }
     }
 
@@ -131,6 +135,8 @@ public final class SwiftletSession: @unchecked Sendable {
             usesGPU = false
         }
         config = model.config
+        assistantHeaderIds = Self.assistantHeaders.first { model.config.modelType.hasPrefix($0.key) }
+            .map { tokenizer.encode(text: $0.value) } ?? []
         generator = TextGenerator(model: model)
         // Special tokens (think tags, chat markup, FIM markers, vision and
         // tool tags) are never legitimate chat output, but a model pushed off
@@ -181,6 +187,8 @@ public final class SwiftletSession: @unchecked Sendable {
         self.appliedCacheBudgetGB = cacheBudgetGB
         self.model = model
         self.config = model.config
+        self.assistantHeaderIds = Self.assistantHeaders.first { model.config.modelType.hasPrefix($0.key) }
+            .map { encodeText($0.value) } ?? []
         self.generator = TextGenerator(model: model)
         self.usesGPU = model is QwenMetalModel
         self.encodeText = encodeText
@@ -193,6 +201,14 @@ public final class SwiftletSession: @unchecked Sendable {
 
     private let suppressedIds: Set<Int>
     private let usesThinkPrompt: Bool
+    // Architecture constants, encoded with this checkpoint's tokenizer: the
+    // ids need not agree across Qwen3-Next and Qwen3.5/3.6 vocabularies.
+    private static let assistantHeaders = [
+        "qwen3_next": "<|im_start|>assistant\n",
+        "qwen3_5": "<|im_start|>assistant\n",
+        "qwen3_6": "<|im_start|>assistant\n",
+    ]
+    private let assistantHeaderIds: [Int]
 
     // Conversation cache: the decode state persists across turns, so a
     // follow-up message only needs its own turn prefilled — without this,
@@ -201,21 +217,21 @@ public final class SwiftletSession: @unchecked Sendable {
     // the cached conversation is decided on token ids: `fedIds` is written
     // where tokens are fed to the model and is the only description of the
     // state anyone consults (the record in colibri's kv_prefix.h). A prompt
-    // that begins with exactly those ids prefills only its tail; one that
-    // diverges anywhere starts over — a changed earlier message, a reply the
-    // client re-tokenizes differently, or a thinking-family template whose
-    // re-render of a past assistant turn drops the empty think block the
-    // state was fed. That last case is deliberate: keying on message strings
-    // (what this did before) reused a state holding `<think>\n\n</think>\n\n`
-    // where a cold prefill of the same transcript holds nothing, so warm and
-    // cold answered from different contexts. Reuse is all or nothing: nothing
-    // here can rewind a state.
+    // that begins with exactly those ids prefills only its tail. Otherwise a
+    // snapshot after the last assistant header can rewind past the think
+    // block a template re-renders differently; its own fed-id record must
+    // match in full. A miss against both states starts over.
     private var convState = QwenCPUModel.DecodeState()
     /// Token ids the current `convState` was built from, in position order.
     private var fedIds: [Int] = []
     /// Set when a step threw after it may have advanced the state, so the
     /// record no longer describes it; such a state is dropped, never reused.
     private var fedTainted = false
+    private struct PromptSnapshot {
+        let data: Data
+        let ids: [Int]
+    }
+    private var promptSnapshot: PromptSnapshot?
 
     /// Off-switch for prefix reuse (`SWIFTLET_KV_PREFIX=0` in the environment
     /// sets it off at init): every turn is then a cold prefill. The B arm of
@@ -249,6 +265,7 @@ public final class SwiftletSession: @unchecked Sendable {
         convState = QwenCPUModel.DecodeState()
         fedIds = []
         fedTainted = false
+        promptSnapshot = nil
     }
 
     /// Test seam: the ids the cached state was built from. Read on the
@@ -271,6 +288,35 @@ public final class SwiftletSession: @unchecked Sendable {
             fedTainted = true
             throw error
         }
+    }
+
+    /// Only recognize a generation suffix whose complete token rendering
+    /// matches: a header in user content must never become a snapshot seam.
+    private func promptSnapshotBoundary(in prompt: [Int]) -> Int? {
+        guard !assistantHeaderIds.isEmpty else { return nil }
+        let opening = usesThinkPrompt
+            ? encodeText("<think>\n") + encodeText("\n</think>\n\n") : []
+        let trailer = assistantHeaderIds + opening
+        guard prompt.count >= trailer.count,
+              prompt.suffix(trailer.count).elementsEqual(trailer) else { return nil }
+        return prompt.count - opening.count
+    }
+
+    /// Feed up through the assistant header, save that exact state and its
+    /// record, then feed the thinking suffix. Instruct prompts end at the
+    /// header, so their first stretch also supplies the generation logits.
+    private func prefill(_ prompt: [Int], from start: Int, shouldCancel: () -> Bool) throws -> [Float] {
+        guard prefixReuseEnabled, let persistable = model as? any PersistableInferenceModel,
+              let boundary = promptSnapshotBoundary(in: prompt), boundary > start else {
+            return try feed(Array(prompt[start...]), shouldCancel: shouldCancel)
+        }
+        var logits = try feed(Array(prompt[start..<boundary]), shouldCancel: shouldCancel)
+        let data = try persistable.snapshot(of: convState)
+        promptSnapshot = PromptSnapshot(data: data, ids: fedIds)
+        if boundary < prompt.count {
+            logits = try feed(Array(prompt[boundary...]), shouldCancel: shouldCancel)
+        }
+        return logits
     }
 
     // Memory-pressure shrink coordination: shrinkCache replaces the expert
@@ -446,17 +492,29 @@ public final class SwiftletSession: @unchecked Sendable {
         return ids
     }
 
-    /// How many leading tokens of `prompt` the cached state already holds:
-    /// all of `fedIds`, or none. Requires at least one new token — a prompt
-    /// equal to or shorter than the record would need the state rewound,
-    /// which nothing here can do, and prefilling zero tokens leaves nothing
-    /// to sample from. The reason is reported either way.
+    /// Prefer an exact live-record match, then an exact snapshot-record
+    /// match. Each requires a nonempty suffix to supply generation logits.
+    /// Partial matches cannot reconstruct the recurrent state.
     func prefixReuse(for prompt: [Int]) -> PrefixReuse {
         guard prefixReuseEnabled else {
             return PrefixReuse(reason: "disabled (SWIFTLET_KV_PREFIX=0 or prefixReuseEnabled = false)")
         }
         guard !fedIds.isEmpty else { return PrefixReuse(reason: "no cached state") }
         guard !fedTainted else { return PrefixReuse(reason: "cached state is tainted") }
+        if fedIds.count < prompt.count, prompt.starts(with: fedIds) {
+            return PrefixReuse(
+                reusedTokens: fedIds.count,
+                reason: "prompt extends the cached state by \(prompt.count - fedIds.count) tokens"
+            )
+        }
+        if let snapshot = promptSnapshot, !snapshot.ids.isEmpty,
+           snapshot.ids.count < prompt.count, prompt.starts(with: snapshot.ids) {
+            return PrefixReuse(
+                reusedTokens: snapshot.ids.count,
+                reason: "prompt extends the assistant-header snapshot by \(prompt.count - snapshot.ids.count) tokens",
+                restoredSnapshot: true
+            )
+        }
         guard fedIds.count < prompt.count else {
             return PrefixReuse(reason: "prompt (\(prompt.count) tokens) does not extend the "
                 + "cached state (\(fedIds.count) tokens); no rewind")
@@ -465,10 +523,7 @@ public final class SwiftletSession: @unchecked Sendable {
             return PrefixReuse(reason: "prompt diverges from the cached state at token \(i) "
                 + "of \(fedIds.count) (cached \(fedIds[i]), prompt \(prompt[i]))")
         }
-        return PrefixReuse(
-            reusedTokens: fedIds.count,
-            reason: "prompt extends the cached state by \(prompt.count - fedIds.count) tokens"
-        )
+        return PrefixReuse(reason: "prompt does not extend either cached state")
     }
 
     /// Drops the replacement characters an incomplete trailing multi-byte
@@ -607,13 +662,7 @@ public final class SwiftletSession: @unchecked Sendable {
                     // ids, and only the tail past the match is fed.
                     let prompt = try self.freshPromptIds(messages)
                     let reuse = self.prefixReuse(for: prompt)
-                    let suffix: [Int]
-                    if reuse.reused {
-                        suffix = Array(prompt[reuse.reusedTokens...])
-                    } else {
-                        self.resetConversationState()
-                        suffix = prompt
-                    }
+                    let suffixCount = prompt.count - reuse.reusedTokens
                     print("[SwiftletSession] prefix: " + (reuse.reused
                         ? "reusing \(reuse.reusedTokens) of \(prompt.count) prompt tokens (\(reuse.reason))"
                         : "none, prefilling \(prompt.count) tokens (\(reuse.reason))"))
@@ -626,13 +675,25 @@ public final class SwiftletSession: @unchecked Sendable {
                         admittedMaxNew = try ContextWindow(
                             maximumTokens: self.model.contextCapacity
                         ).admittedMaxNew(
-                            processedTokens: self.convState.position,
-                            incomingTokens: suffix.count,
+                            processedTokens: reuse.reusedTokens,
+                            incomingTokens: suffixCount,
                             requestedMaxNew: maxNew
                         )
                     } catch {
                         terminalError = error
                         return
+                    }
+
+                    // Restoring (or dropping) a state happens only once the
+                    // request is admitted, so a rejected retry preserves both
+                    // records and can still reuse the preceding conversation.
+                    if reuse.restoredSnapshot, let snapshot = self.promptSnapshot,
+                       let persistable = self.model as? any PersistableInferenceModel {
+                        self.convState = try persistable.restoreState(from: snapshot.data)
+                        self.fedIds = snapshot.ids
+                        self.fedTainted = false
+                    } else if !reuse.reused {
+                        self.resetConversationState()
                     }
 
                     let start = Date()
@@ -646,7 +707,8 @@ public final class SwiftletSession: @unchecked Sendable {
                     var finishReason = GenerationFinishReason.length
 
                     do {
-                        var logits = try self.feed(suffix, shouldCancel: { control.isCancelled })
+                        var logits = try self.prefill(prompt, from: reuse.reusedTokens,
+                                                     shouldCancel: { control.isCancelled })
                         prefillDone = Date()
 
                         for _ in 0..<admittedMaxNew {
@@ -757,7 +819,7 @@ public final class SwiftletSession: @unchecked Sendable {
                     if self.fedTainted { self.resetConversationState() }
 
                     self.storeMetrics(Metrics(
-                        promptTokens: suffix.count,
+                        promptTokens: suffixCount,
                         generatedTokens: generated.count,
                         timeToFirstToken: (firstTokenAt ?? prefillDone).timeIntervalSince(start),
                         tokensPerSecond: decodeSeconds > 0 ? Double(generated.count) / decodeSeconds : 0,
