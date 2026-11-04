@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import Tokenizers
 @testable import SwiftletCore
 
 /// Port of colibri's `PrefixReuseContract` (`c/tests/test_inkling_prefix_serve.py`
@@ -67,7 +68,7 @@ import Testing
     /// ids rank the vocabulary differently. Positions advance like the real
     /// models; a state at position 0 is fresh and starts a new history.
     private final class HistoryModel: PersistableInferenceModel, @unchecked Sendable {
-        let config: QwenConfig
+        var config: QwenConfig
         let modelDir: URL
         private let lock = NSLock()
         private var histories: [ObjectIdentifier: [Int]] = [:]
@@ -261,6 +262,75 @@ import Testing
         let cold = try Self.makeHarness(think: true)
         let fresh = try await Self.ask(cold, transcript)
         #expect(Array(rerendered.utf8) == Array(fresh.utf8))
+    }
+
+    /// Exercise the real Tokenizers renderer/encoder, with a small local BPE
+    /// vocabulary and each supported family's ChatML generation suffix. A
+    /// wrong header or a boundary after the think opening loses this reuse.
+    @Test(arguments: ["qwen3_next", "qwen3_5_moe", "qwen3_6_moe"])
+    func assistantHeaderSnapshotMatchesTokenizerRendering(modelType: String) async throws {
+        let thinking = modelType != "qwen3_next"
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+
+        var vocab = ["[UNK]": 0, "<|im_start|>": 1, "<|im_end|>": 2, "<think>": 3, "</think>": 4]
+        for scalar in [10] + Array(32...126) {
+            vocab[String(Unicode.Scalar(scalar)!)] = vocab.count
+        }
+        let added: [[String: Any]] = ["<|im_start|>", "<|im_end|>", "<think>", "</think>"].map {
+            ["id": vocab[$0]!, "content": $0, "single_word": false,
+             "lstrip": false, "rstrip": false, "normalized": false, "special": true]
+        }
+        let tokenizerData: [String: Any] = [
+            "model": ["type": "BPE", "vocab": vocab, "merges": [String](), "unk_token": "[UNK]"],
+            "added_tokens": added,
+        ]
+        // A deliberately small template, authored here rather than copied
+        // from a checkpoint. Past assistant turns omit the think block.
+        let template = "{% for m in messages %}{{ '<|im_start|>' + m.role + '\\n' + m.content + '<|im_end|>\\n' }}{% endfor %}"
+            + "{{ '<|im_start|>assistant\\n' }}" + (thinking ? "{{ '<think>\\n' }}" : "")
+        let tokenizerConfig: [String: Any] = [
+            "tokenizer_class": "PreTrainedTokenizer", "unk_token": "[UNK]",
+            "chat_template": template, "clean_up_tokenization_spaces": false,
+        ]
+        try JSONSerialization.data(withJSONObject: tokenizerData).write(to: folder.appendingPathComponent("tokenizer.json"))
+        try JSONSerialization.data(withJSONObject: tokenizerConfig).write(to: folder.appendingPathComponent("tokenizer_config.json"))
+        let tokenizer = try await AutoTokenizer.from(modelFolder: folder)
+        let model = try HistoryModel(modelDir: Self.fixturesDir.appendingPathComponent("tiny-model"))
+        model.config.modelType = modelType
+        let session = SwiftletSession(
+            testingModel: model, modelDir: model.modelDir,
+            encodeText: { tokenizer.encode(text: $0) },
+            decodeTokens: { tokenizer.decode(tokens: $0) },
+            renderMessages: { try tokenizer.applyChatTemplate(messages: $0) },
+            usesThinkPrompt: thinking
+        )
+        let harness = Harness(model: model, session: session)
+        let first = try await Self.ask(harness, Self.q1)
+        let rendered = try tokenizer.applyChatTemplate(messages: Self.q1)
+        let header = tokenizer.encode(text: "<|im_start|>assistant\n")
+        let openingCount = thinking ? tokenizer.encode(text: "<think>\n").count : 0
+        let boundary = rendered.count - openingCount
+        #expect(Array(rendered.prefix(boundary).suffix(header.count)) == header)
+        #expect(model.calls.first == Array(rendered.prefix(boundary)))
+
+        _ = try await Self.ask(harness, Self.q2(after: first))
+        let decision = session.lastMetrics.prefixReuse
+        #expect(decision.reusedTokens == (thinking ? boundary : boundary + Self.turns),
+                Comment(rawValue: decision.reason))
+    }
+
+    @Test func thirdThinkingTurnUsesTheLatestSnapshot() async throws {
+        let warm = try Self.makeHarness(think: true)
+        let first = try await Self.ask(warm, Self.q1)
+        let secondTranscript = Self.q2(after: first)
+        let second = try await Self.ask(warm, secondTranscript)
+        let thirdTranscript = Self.q2(after: second, secondTranscript)
+        let third = try await Self.ask(warm, thirdTranscript)
+        #expect(warm.session.lastMetrics.prefixReuse.reusedTokens == Self.render(secondTranscript, think: true).count - 1)
+        let cold = try Self.makeHarness(think: true)
+        #expect(try await Self.ask(cold, thirdTranscript) == third)
     }
 
     /// A prompt equal to (or shorter than) what the state holds would need a
