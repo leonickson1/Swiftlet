@@ -348,6 +348,16 @@ final class HTTPHandler: ChannelInboundHandler {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
 
+    private let session: SwiftletSession
+    private let modelName: String
+    private let generationQueue: DispatchQueue
+
+    init(session: SwiftletSession, modelName: String, generationQueue: DispatchQueue) {
+        self.session = session
+        self.modelName = modelName
+        self.generationQueue = generationQueue
+    }
+
     private var requestHead: HTTPRequestHead?
     private var body = ByteBuffer()
     /// Set once a request has been refused from its head or its body size:
@@ -454,6 +464,8 @@ final class HTTPHandler: ChannelInboundHandler {
         let channel = context.channel
         let cancellation = GenerationCancellation()
         let owner = generationOwner
+        let session = self.session
+        let modelName = self.modelName
         owner.register(id: id, cancellation: cancellation)
 
         /// Every chat write is observed. A failed outbound future cancels this
@@ -551,7 +563,7 @@ final class HTTPHandler: ChannelInboundHandler {
                     ) {
                         fullText += delta
                         if streaming {
-                            writeSSE(completionPayload(id: id, text: nil, delta: delta, finish: nil))
+                            writeSSE(completionPayload(id: id, text: nil, delta: delta, finish: nil, model: modelName))
                         }
                     }
                     let m = session.lastMetrics
@@ -578,7 +590,7 @@ final class HTTPHandler: ChannelInboundHandler {
                             // (strict clients then wait for it forever).
                             let finish = jsonData(completionPayload(
                                 id: id, text: nil, delta: "", finish: finishReason,
-                                usage: (m.promptTokens, m.generatedTokens)))
+                            usage: (m.promptTokens, m.generatedTokens), model: modelName))
                             let tail = "data: " + (String(data: finish, encoding: .utf8) ?? "{}")
                                 + "\n\ndata: [DONE]\n\n"
                             var buf = channel.allocator.buffer(capacity: tail.utf8.count)
@@ -593,7 +605,7 @@ final class HTTPHandler: ChannelInboundHandler {
                         } else {
                             let data = jsonData(completionPayload(
                                 id: id, text: fullText, delta: nil, finish: finishReason,
-                                usage: (m.promptTokens, m.generatedTokens)))
+                                usage: (m.promptTokens, m.generatedTokens), model: modelName))
                             var head = HTTPResponseHead(version: .http1_1, status: .ok)
                             head.headers.add(name: "Content-Type", value: "application/json")
                             head.headers.add(name: "Content-Length", value: String(data.count))
@@ -687,7 +699,8 @@ let bootstrap = ServerBootstrap(group: group)
     .serverChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
     .childChannelInitializer { channel in
         channel.pipeline.configureHTTPServerPipeline().flatMap {
-            channel.pipeline.addHandler(HTTPHandler())
+            channel.pipeline.addHandler(HTTPHandler(
+                session: session, modelName: modelName, generationQueue: generationQueue))
         }
     }
 
