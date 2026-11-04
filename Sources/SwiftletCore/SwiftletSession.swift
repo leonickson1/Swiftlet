@@ -310,8 +310,9 @@ public final class SwiftletSession: @unchecked Sendable {
     /// Feed up through the assistant header, save that exact state and its
     /// record, then feed the thinking suffix. Instruct prompts end at the
     /// header, so their first stretch also supplies the generation logits.
-    private func prefill(_ prompt: [Int], from start: Int, shouldCancel: () -> Bool) throws -> [Float] {
-        guard prefixReuseEnabled, let persistable = model as? any PersistableInferenceModel,
+    private func prefill(_ prompt: [Int], from start: Int, snapshotEnabled: Bool,
+                         shouldCancel: () -> Bool) throws -> [Float] {
+        guard snapshotEnabled, let persistable = model as? any PersistableInferenceModel,
               let boundary = promptSnapshotBoundary(in: prompt), boundary > start else {
             return try feed(Array(prompt[start...]), shouldCancel: shouldCancel)
         }
@@ -500,12 +501,12 @@ public final class SwiftletSession: @unchecked Sendable {
     /// Prefer an exact live-record match, then an exact snapshot-record
     /// match. Each requires a nonempty suffix to supply generation logits.
     /// Partial matches cannot reconstruct the recurrent state.
-    func prefixReuse(for prompt: [Int]) -> PrefixReuse {
+    func prefixReuse(for prompt: [Int], enabled: Bool) -> PrefixReuse {
         let liveFollow = Self.followedTokens(fedIds, in: prompt)
         let snapshotFollow = Self.followedTokens(promptSnapshot?.ids ?? [], in: prompt)
         let stopped = max(liveFollow, snapshotFollow)
         let stopText = decodeTokens(Array(prompt[stopped..<min(stopped + 16, prompt.count)]))
-        var decision = prefixReuseDecision(for: prompt)
+        var decision = prefixReuseDecision(for: prompt, enabled: enabled)
         decision.reason += "; followed the live state for \(liveFollow), the snapshot for \(snapshotFollow), "
             + "stopped at \(String(reflecting: stopText))"
         return decision
@@ -517,8 +518,8 @@ public final class SwiftletSession: @unchecked Sendable {
         return count
     }
 
-    private func prefixReuseDecision(for prompt: [Int]) -> PrefixReuse {
-        guard prefixReuseEnabled else {
+    private func prefixReuseDecision(for prompt: [Int], enabled: Bool) -> PrefixReuse {
+        guard enabled else {
             return PrefixReuse(reason: "disabled (SWIFTLET_KV_PREFIX=0 or prefixReuseEnabled = false)")
         }
         guard !fedIds.isEmpty else { return PrefixReuse(reason: "no cached state") }
@@ -683,7 +684,8 @@ public final class SwiftletSession: @unchecked Sendable {
                     // is; the cached state is compared against it on token
                     // ids, and only the tail past the match is fed.
                     let prompt = try self.freshPromptIds(messages)
-                    let reuse = self.prefixReuse(for: prompt)
+                    let reuseEnabled = self.prefixReuseEnabled
+                    let reuse = self.prefixReuse(for: prompt, enabled: reuseEnabled)
                     let suffixCount = prompt.count - reuse.reusedTokens
                     let prefixReason = ProcessInfo.processInfo.environment["SWIFTLET_PREFIX_LOG"] == "1"
                         ? reuse.reason : reuse.summaryReason
@@ -708,6 +710,7 @@ public final class SwiftletSession: @unchecked Sendable {
                         return
                     }
 
+                    let start = Date()
                     // Restoring (or dropping) a state happens only once the
                     // request is admitted, so a rejected retry preserves both
                     // records and can still reuse the preceding conversation.
@@ -720,7 +723,6 @@ public final class SwiftletSession: @unchecked Sendable {
                         self.resetConversationState()
                     }
 
-                    let start = Date()
                     var firstTokenAt: Date?
                     var generated: [Int] = []
                     var generatedCounts: [Int: Int] = [:]
@@ -732,6 +734,7 @@ public final class SwiftletSession: @unchecked Sendable {
 
                     do {
                         var logits = try self.prefill(prompt, from: reuse.reusedTokens,
+                                                     snapshotEnabled: reuseEnabled,
                                                      shouldCancel: { control.isCancelled })
                         prefillDone = Date()
 

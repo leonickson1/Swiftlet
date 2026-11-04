@@ -11,7 +11,9 @@ Swiftlet builds on the work of several open-source projects.
   `.gturbo` format and runtime.
 - **colibrì** (Apache 2.0), https://github.com/JustVugg/colibri: cache and
   placement policies (learned pinning, router-lookahead prefetch, batch-union
-  prefill) and the correctness-first measurement discipline.
+  prefill) and the correctness-first measurement discipline. The answer-start
+  snapshot rule follows PR #2517, commit `d175038c6a9e` (`c/qwen38.c`);
+  no C implementation is copied.
 
 ## Reference implementations
 

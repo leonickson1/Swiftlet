@@ -153,6 +153,15 @@ routes every token to 10 of 512 experts (80B) or 8 of 256 (35B). Swiftlet:
 fixed-size recurrent state, so there is no growing KV cache for those layers
 at any context length.
 
+Chat sessions reuse the live state when its fed token ids match the next
+prompt. They also keep one in-memory snapshot after the assistant header,
+before the think block, so a follow-up whose template re-renders that block
+can restore the matching prefix and prefill the remainder. Set
+`SWIFTLET_PREFIX_LOG=1` for the live and snapshot follow counts and escaped
+text at the stopping point; the full diagnostic is also in
+`lastMetrics.prefixReuse.reason`. `SWIFTLET_KV_PREFIX=0` disables both forms
+of reuse for a cold-prefill comparison.
+
 ## Four ways to use it
 
 Swiftlet is a library first:

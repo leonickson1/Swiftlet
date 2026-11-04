@@ -1,8 +1,9 @@
 # Qwen3.6 prompt snapshot tokenizer fixture
 
 Apache 2.0, Alibaba's Qwen team. Source: the tokenizer metadata accompanying
-[Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B), read from the
+[Qwen3.6-35B-A3B](https://huggingface.co/Qwen/Qwen3.6-35B-A3B/tree/995ad96eacd98c81ed38be0c5b274b04031597b0), read from the
 installed `Qwen3.6-35B-A3B-4bit-qpack` checkpoint on 2026-11-04.
+The chat template also matches that upstream revision byte for byte.
 
 `chat_template.jinja` and `tokenizer_config.json` are unchanged. The
 `tokenizer.json` retains the original preprocessing/decoding configuration,

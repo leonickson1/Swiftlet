@@ -343,7 +343,20 @@ import Tokenizers
         // Six ChatML/role ids, then the fifteen bytes "The capital of ".
         #expect(decision.reason.contains("followed the live state for 21, the snapshot for 21"),
                 Comment(rawValue: decision.reason))
-        #expect(decision.reason.contains("stopped at \"Italy isuser\""), Comment(rawValue: decision.reason))
+        #expect(decision.reason.contains("stopped at \"Italy isassis\""), Comment(rawValue: decision.reason))
+    }
+
+    @Test func thinkingOffSwitchAlsoDisablesSnapshots() async throws {
+        let harness = try Self.makeHarness(think: true)
+        harness.session.prefixReuseEnabled = false
+        let first = try await Self.ask(harness, Self.q1)
+        #expect(harness.model.calls.first == Self.render(Self.q1, think: true) + [Self.thinkClose])
+        let transcript = Self.q2(after: first)
+        let output = try await Self.ask(harness, transcript)
+        #expect(!harness.session.lastMetrics.prefixReuse.reused)
+        #expect(harness.session.lastMetrics.prefixReuse.reason.contains("disabled"))
+        let cold = try Self.makeHarness(think: true)
+        #expect(try await Self.ask(cold, transcript) == output)
     }
 
     @Test func rejectedSnapshotContinuationKeepsBothRecords() async throws {
