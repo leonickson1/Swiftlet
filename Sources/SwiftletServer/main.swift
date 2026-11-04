@@ -241,8 +241,10 @@ struct RequestRefusal: Swift.Error, CustomStringConvertible, Equatable {
 }
 
 /// The role/content pairs passed to the session, before rendering or queueing.
+/// Treat OpenAI developer instructions as system instructions for both the
+/// checkpoint template and the warm conversation's prefix comparison.
 @Sendable func chatMessages(_ request: ChatRequest) -> [[String: String]] {
-    request.messages.map { ["role": $0.role, "content": $0.content.text] }
+    request.messages.map { ["role": $0.role == "developer" ? "system" : $0.role, "content": $0.content.text] }
 }
 
 /// The generation budget a chat request asks for. `max_tokens` wins over
