@@ -24,7 +24,7 @@ import Testing
 
         var calls: [[Int]] { locked { _calls } }
         var blocked: Bool { locked { _blocked } }
-        func blockNextStep() { locked { blockNext = true } }
+        func blockNextDecode() { locked { blockNext = true } }
 
         func step(_ tokens: [Int], state: QwenCPUModel.DecodeState) throws -> [Float] {
             try step(tokens, state: state, shouldCancel: { false })
@@ -34,8 +34,8 @@ import Testing
                   shouldCancel: () -> Bool) throws -> [Float] {
             let shouldBlock = locked {
                 _calls.append(tokens)
-                let value = blockNext
-                blockNext = false
+                let value = blockNext && tokens == [65]
+                if value { blockNext = false }
                 _blocked = value
                 return value
             }
@@ -169,7 +169,7 @@ import Testing
             let next = first + [
                 ["role": "assistant", "content": "A"], ["role": "user", "content": "next"],
             ]
-            model.blockNextStep()
+            model.blockNextDecode()
             let streamRequest = chat(base, messages: next, stream: true)
             let stream = Task {
                 do {
@@ -192,9 +192,10 @@ import Testing
             #expect((response as? HTTPURLResponse)?.statusCode == 200)
             try await stream.value
             #expect(session.lastMetrics.finishReason == .cancelled)
+            #expect(session.lastMetrics.generatedTokens == 1)
 
             _ = try await URLSession.shared.data(for: chat(base, messages: next))
-            #expect(model.calls == [[10], [65], [30], [10, 65, 20], [65]],
+            #expect(model.calls == [[10], [65], [30], [65], [10, 65, 20], [65]],
                     "the request after cancellation must prefill the complete transcript")
         }
     }
