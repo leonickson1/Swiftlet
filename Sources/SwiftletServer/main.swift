@@ -424,6 +424,21 @@ final class HTTPHandler: ChannelInboundHandler {
             ]))
         case (.POST, "/v1/chat/completions"):
             handleChat(context: context, body: body)
+        case (.POST, "/v1/cache/flush"):
+            // The server generation queue waits for the entire reply. Reset
+            // from another worker so it can cancel that reply at a safe
+            // boundary, without blocking NIO's event loop. Acknowledge only
+            // after the session has discarded its conversation state.
+            let reset = context.eventLoop.makePromise(of: Void.self)
+            let session = self.session
+            DispatchQueue.global(qos: .userInitiated).async {
+                session.resetConversation()
+                reset.succeed(())
+            }
+            reset.futureResult.whenSuccess {
+                self.respondJSON(context, status: .ok,
+                                 data: jsonData(["status": "ok", "flushed": true]))
+            }
         default:
             respondJSON(context, status: .notFound, data: jsonData(["error": "not found"]))
         }
@@ -577,6 +592,10 @@ final class HTTPHandler: ChannelInboundHandler {
                         guard channel.isActive, m.finishReason != .cancelled else {
                             cancellation.cancel()
                             owner.failWrite(id: id)
+                            // Flush can cancel a generation whose client is
+                            // still connected. End that SSE connection too;
+                            // there is no OpenAI finish reason for cancellation.
+                            if channel.isActive { channel.close(promise: nil) }
                             return
                         }
                         owner.stopHeartbeat(id: id)

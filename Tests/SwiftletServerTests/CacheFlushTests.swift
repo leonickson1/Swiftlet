@@ -180,6 +180,7 @@ import Testing
                     #expect(error.code == .networkConnectionLost)
                 }
             }
+            defer { stream.cancel() }
             let deadline = Date().addingTimeInterval(1)
             while !model.blocked, Date() < deadline {
                 try await Task<Never, Never>.sleep(nanoseconds: 1_000_000)
