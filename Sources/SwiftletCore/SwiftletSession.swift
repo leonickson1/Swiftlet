@@ -135,7 +135,8 @@ public final class SwiftletSession: @unchecked Sendable {
             usesGPU = false
         }
         config = model.config
-        assistantHeaderIds = Self.assistantHeaders.first { model.config.modelType.hasPrefix($0.key) }
+        let modelType = config.modelType
+        assistantHeaderIds = Self.assistantHeaders.first { modelType.hasPrefix($0.key) }
             .map { tokenizer.encode(text: $0.value) } ?? []
         generator = TextGenerator(model: model)
         // Special tokens (think tags, chat markup, FIM markers, vision and
