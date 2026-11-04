@@ -30,6 +30,11 @@ Swiftlet builds on the work of several open-source projects.
 
 ## Model weights
 
+`fixtures/prompt-snapshot-tokenizer/` contains Qwen3.6 tokenizer metadata
+from Alibaba's Qwen team (Apache 2.0): the chat template and tokenizer
+configuration, and a reduced vocabulary/merge table for the header test.
+Its README records the source and reductions. No model weights are included.
+
 Model weights are not distributed with this project. The Qwen3-Next and
 Qwen3.5/3.6 checkpoints are released by Alibaba's Qwen team under Apache 2.0;
 quantized community conversions are downloaded from their respective Hugging

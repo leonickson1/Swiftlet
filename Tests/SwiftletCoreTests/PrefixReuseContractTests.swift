@@ -7,8 +7,8 @@ import Tokenizers
 /// over `c/kv_prefix.h`): reusing a previous turn's state must change nothing
 /// but the time. Two turns on one session, the second reusing the first's
 /// state, must produce byte-identical output to the second turn alone on a
-/// cold session; every rejection path — a changed earlier message, the
-/// off-switch, a thinking-family re-render — must equal cold as well.
+/// cold session; rejection paths and a thinking-family re-render restored
+/// from the assistant-header snapshot must equal cold as well.
 ///
 /// The model here answers from its whole fed history, so a state that belongs
 /// to a different conversation produces different bytes: the contract can
@@ -377,6 +377,35 @@ import Tokenizers
         #expect(!harness.session.lastMetrics.prefixReuse.restoredSnapshot)
     }
 
+    /// The installed Qwen3.6 tokenizer's vocabulary, merge order and template
+    /// (reduced to the pieces this prompt uses), through Tokenizers itself.
+    @Test func qwen36HeaderMatchesTheCheckpointTokenizerRendering() async throws {
+        let tokenizer = try await AutoTokenizer.from(
+            modelFolder: Self.fixturesDir.appendingPathComponent("prompt-snapshot-tokenizer")
+        )
+        let question = [["role": "user", "content": "hi"]]
+        let rendered = try tokenizer.applyChatTemplate(messages: question)
+        #expect(rendered == [248045, 846, 198, 5834, 248046, 198, 248045, 74455, 198, 248068, 198])
+        #expect(tokenizer.encode(text: "<|im_start|>assistant\n") == [248045, 74455, 198])
+        let model = try HistoryModel(modelDir: Self.fixturesDir.appendingPathComponent("tiny-model"))
+        model.config.modelType = "qwen3_5_moe"
+        let session = SwiftletSession(
+            testingModel: model, modelDir: model.modelDir,
+            encodeText: { tokenizer.encode(text: $0) },
+            decodeTokens: { tokenizer.decode(tokens: $0) },
+            renderMessages: { try tokenizer.applyChatTemplate(messages: $0) }, usesThinkPrompt: true
+        )
+        for try await _ in session.streamChat(messages: question, maxNew: 0) {}
+        #expect(model.calls.first == [248045, 846, 198, 5834, 248046, 198, 248045, 74455, 198])
+        let transcript = question + [
+            ["role": "assistant", "content": "hi"], ["role": "user", "content": "hi"],
+        ]
+        for try await _ in session.streamChat(messages: transcript, maxNew: 0) {}
+        #expect(session.lastMetrics.prefixReuse.reusedTokens == 9)
+        #expect(session.lastMetrics.prefixReuse.restoredSnapshot)
+        #expect(!session.lastMetrics.prefixReuse.reason.contains("\n"), "stop text must stay on one log line")
+    }
+
     /// Use actual CPU/Metal recurrence and SWLSTATE bytes as well as the
     /// history probe: restoring the session's seam must equal a cold render.
     @Test(arguments: [false, true])
@@ -449,7 +478,7 @@ import Tokenizers
         _ = try await Self.ask(harness, retry)
         let decision = harness.session.lastMetrics.prefixReuse
         #expect(!decision.reused)
-        #expect(decision.reason == "no cached state", Comment(rawValue: decision.reason))
+        #expect(decision.reason.hasPrefix("no cached state"), Comment(rawValue: decision.reason))
     }
 
     /// The record must be the session's own storage, never a view of the

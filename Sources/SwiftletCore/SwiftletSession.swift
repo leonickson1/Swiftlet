@@ -22,7 +22,10 @@ public final class SwiftletSession: @unchecked Sendable {
         /// Prompt tokens the cached state already covered. 0 means the whole
         /// prompt was prefilled, and `reason` says why.
         public var reusedTokens: Int
+        /// Full diagnostic, including both follow counts and escaped stop
+        /// text. Logs include the long form only with SWIFTLET_PREFIX_LOG=1.
         public var reason: String
+        fileprivate var summaryReason: String
         /// The prompt matched the saved answer-start state rather than the
         /// live state, which may contain a differently rendered think block.
         public var restoredSnapshot: Bool
@@ -30,6 +33,7 @@ public final class SwiftletSession: @unchecked Sendable {
         public init(reusedTokens: Int = 0, reason: String = "", restoredSnapshot: Bool = false) {
             self.reusedTokens = reusedTokens
             self.reason = reason
+            self.summaryReason = reason
             self.restoredSnapshot = restoredSnapshot
         }
     }
@@ -497,6 +501,23 @@ public final class SwiftletSession: @unchecked Sendable {
     /// match. Each requires a nonempty suffix to supply generation logits.
     /// Partial matches cannot reconstruct the recurrent state.
     func prefixReuse(for prompt: [Int]) -> PrefixReuse {
+        let liveFollow = Self.followedTokens(fedIds, in: prompt)
+        let snapshotFollow = Self.followedTokens(promptSnapshot?.ids ?? [], in: prompt)
+        let stopped = max(liveFollow, snapshotFollow)
+        let stopText = decodeTokens(Array(prompt[stopped..<min(stopped + 16, prompt.count)]))
+        var decision = prefixReuseDecision(for: prompt)
+        decision.reason += "; followed the live state for \(liveFollow), the snapshot for \(snapshotFollow), "
+            + "stopped at \(String(reflecting: stopText))"
+        return decision
+    }
+
+    private static func followedTokens(_ record: [Int], in prompt: [Int]) -> Int {
+        var count = 0
+        while count < min(record.count, prompt.count), record[count] == prompt[count] { count += 1 }
+        return count
+    }
+
+    private func prefixReuseDecision(for prompt: [Int]) -> PrefixReuse {
         guard prefixReuseEnabled else {
             return PrefixReuse(reason: "disabled (SWIFTLET_KV_PREFIX=0 or prefixReuseEnabled = false)")
         }
@@ -664,9 +685,11 @@ public final class SwiftletSession: @unchecked Sendable {
                     let prompt = try self.freshPromptIds(messages)
                     let reuse = self.prefixReuse(for: prompt)
                     let suffixCount = prompt.count - reuse.reusedTokens
+                    let prefixReason = ProcessInfo.processInfo.environment["SWIFTLET_PREFIX_LOG"] == "1"
+                        ? reuse.reason : reuse.summaryReason
                     print("[SwiftletSession] prefix: " + (reuse.reused
-                        ? "reusing \(reuse.reusedTokens) of \(prompt.count) prompt tokens (\(reuse.reason))"
-                        : "none, prefilling \(prompt.count) tokens (\(reuse.reason))"))
+                        ? "reusing \(reuse.reusedTokens) of \(prompt.count) prompt tokens (\(prefixReason))"
+                        : "none, prefilling \(prompt.count) tokens (\(prefixReason))"))
                     // Admission runs before any model call, so a rejection
                     // leaves the cached conversation exactly as the client
                     // last saw it. Keep it: a shorter retry can then continue
