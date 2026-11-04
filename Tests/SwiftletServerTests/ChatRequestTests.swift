@@ -226,6 +226,40 @@ import SwiftletCore
 
     // MARK: request limits, decided before the model is touched
 
+    /// Neither a batch of choices nor best-of sampling is supported. The
+    /// admission check must refuse the field before streaming can begin.
+    @Test func multipleChoicesAreRefusedByName() throws {
+        for field in ["n", "best_of"] {
+            for value in [0, -5, 2, Int.max] {
+                for stream in [false, true] {
+                    let request = try decode(
+                        #"{"messages":[],"\#(field)":\#(value),"stream":\#(stream)}"#)
+                    do {
+                        _ = try requestedMaxNew(request)
+                        Issue.record("\(field)=\(value), stream=\(stream) was admitted")
+                    } catch let refusal as RequestRefusal {
+                        #expect(refusal.status == .badRequest)
+                        #expect(refusal.description.hasPrefix(field + " "), "the refusal must name the field: \(refusal)")
+                        #expect(refusal.description.contains("got \(value)"))
+                    }
+                }
+            }
+        }
+    }
+
+    /// Absent, null and explicit single-choice fields keep the same budget.
+    @Test func singleChoiceIsAdmittedAsBefore() throws {
+        for json in [
+            #"{"messages":[],"max_tokens":7}"#,
+            #"{"messages":[],"max_tokens":7,"n":1}"#,
+            #"{"messages":[],"max_tokens":7,"best_of":1}"#,
+            #"{"messages":[],"max_tokens":7,"n":1,"best_of":1,"stream":true}"#,
+            #"{"messages":[],"max_tokens":7,"n":null,"best_of":null}"#,
+        ] {
+            #expect(try requestedMaxNew(decode(json)) == 7)
+        }
+    }
+
     /// `max_tokens: 0` is refused by the field's name. mlx-lm's server
     /// accepted 0 and let the generator reject it (mlx-lm `bacd9e8`); here it
     /// ran prefill and returned an empty completion. A negative value is
