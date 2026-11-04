@@ -36,6 +36,7 @@ import Testing
         switch text {
         case "<think>\n": return [thinkOpen]
         case "\n</think>\n\n": return [thinkClose]
+        case "<|im_start|>assistant\n": return [imStart] + bytes("assistant") + [10]
         default: return bytes(text)
         }
     }
@@ -65,7 +66,7 @@ import Testing
     /// every id the state has consumed, so two states built from different
     /// ids rank the vocabulary differently. Positions advance like the real
     /// models; a state at position 0 is fresh and starts a new history.
-    private final class HistoryModel: InferenceModel, @unchecked Sendable {
+    private final class HistoryModel: PersistableInferenceModel, @unchecked Sendable {
         let config: QwenConfig
         let modelDir: URL
         private let lock = NSLock()
@@ -82,6 +83,22 @@ import Testing
         }
 
         var calls: [[Int]] { lock.lock(); defer { lock.unlock() }; return _calls }
+
+        func snapshot(of state: QwenCPUModel.DecodeState) throws -> Data {
+            lock.lock()
+            defer { lock.unlock() }
+            return try JSONEncoder().encode(histories[ObjectIdentifier(state)] ?? [])
+        }
+
+        func restoreState(from data: Data) throws -> QwenCPUModel.DecodeState {
+            let history = try JSONDecoder().decode([Int].self, from: data)
+            let state = QwenCPUModel.DecodeState()
+            state.position = history.count
+            lock.lock()
+            histories[ObjectIdentifier(state)] = history
+            lock.unlock()
+            return state
+        }
 
         func step(_ tokens: [Int], state: QwenCPUModel.DecodeState) throws -> [Float] {
             lock.lock()
@@ -221,26 +238,25 @@ import Testing
         #expect(Array(withoutReuse.utf8) == Array(fresh.utf8))
     }
 
-    /// Thinking-family templates: the state holds the empty think block the
-    /// session fed to keep reasoning off, the re-render of that assistant
-    /// turn has none, so the ids diverge there and the prefix is invalidated.
-    /// This is the deliberate choice — a reused state would answer from a
-    /// context the cold prefill never builds.
-    @Test func thinkBlockReRenderIsNotReused() async throws {
+    /// The live state includes an empty think block that the next rendering
+    /// drops. A snapshot after the assistant header must still match, and
+    /// restoring it must produce the same answer as a cold full transcript.
+    @Test func reRenderedThinkBlockReusesAssistantHeaderSnapshot() async throws {
         let warm = try Self.makeHarness(think: true)
         let first = try await Self.ask(warm, Self.q1)
         let promptOne = Self.render(Self.q1, think: true) + [Self.thinkClose]
-        #expect(warm.model.calls.first == promptOne, "the empty think block is fed after <think>")
+        let answerStart = promptOne.count - 2
+        #expect(warm.model.calls.first == Array(promptOne.prefix(answerStart)))
+        #expect(warm.model.calls.dropFirst().first == [Self.thinkOpen, Self.thinkClose])
         let transcript = Self.q2(after: first)
         let rerendered = try await Self.ask(warm, transcript)
         let decision = warm.session.lastMetrics.prefixReuse
-        #expect(!decision.reused)
-        // The ids agree up to `<|im_start|>assistant\n`; the state's next id is
-        // the think block, the re-render's is the reply's first byte.
-        #expect(decision.reason.contains("diverges from the cached state at token \(promptOne.count - 2)"),
-                Comment(rawValue: decision.reason))
+        #expect(decision.reusedTokens == answerStart, Comment(rawValue: decision.reason))
+        #expect(decision.reason.contains("snapshot"), Comment(rawValue: decision.reason))
         let promptTwo = Self.render(transcript, think: true) + [Self.thinkClose]
-        #expect(warm.model.calls.last(where: { $0.count > 1 }) == promptTwo)
+        let secondPrefill = warm.model.calls.dropFirst(Self.turns + 2).prefix(2).flatMap { $0 }
+        #expect(secondPrefill == Array(promptTwo.dropFirst(answerStart)))
+        #expect(warm.session.lastMetrics.promptTokens == promptTwo.count - answerStart)
 
         let cold = try Self.makeHarness(think: true)
         let fresh = try await Self.ask(cold, transcript)
