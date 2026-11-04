@@ -333,6 +333,84 @@ import Tokenizers
         #expect(try await Self.ask(cold, thirdTranscript) == third)
     }
 
+    @Test func prefixMissReportsBothFollowCountsAndStopText() async throws {
+        let harness = try Self.makeHarness(think: true)
+        let first = try await Self.ask(harness, Self.q1)
+        let edited = [["role": "user", "content": "The capital of Italy is"]]
+        _ = try await Self.ask(harness, Self.q2(after: first, edited))
+        let decision = harness.session.lastMetrics.prefixReuse
+        #expect(!decision.reused)
+        // Six ChatML/role ids, then the fifteen bytes "The capital of ".
+        #expect(decision.reason.contains("followed the live state for 21, the snapshot for 21"),
+                Comment(rawValue: decision.reason))
+        #expect(decision.reason.contains("stopped at \"Italy isuser\""), Comment(rawValue: decision.reason))
+    }
+
+    @Test func rejectedSnapshotContinuationKeepsBothRecords() async throws {
+        let harness = try Self.makeHarness(think: true)
+        let first = try await Self.ask(harness, Self.q1)
+        let original = harness.session.cachedConversationIds()
+        let calls = harness.model.calls.count
+        let tooLong = Self.q1 + [
+            ["role": "assistant", "content": first],
+            ["role": "user", "content": String(repeating: "x", count: 512)],
+        ]
+        await #expect(throws: ContextWindowError.self) {
+            _ = try await Self.ask(harness, tooLong)
+        }
+        #expect(harness.session.cachedConversationIds() == original)
+        #expect(harness.model.calls.count == calls)
+
+        let transcript = Self.q2(after: first)
+        let retry = try await Self.ask(harness, transcript)
+        #expect(harness.session.lastMetrics.prefixReuse.restoredSnapshot)
+        let cold = try Self.makeHarness(think: true)
+        #expect(try await Self.ask(cold, transcript) == retry)
+    }
+
+    @Test func resetConversationDropsThePromptSnapshot() async throws {
+        let harness = try Self.makeHarness(think: true)
+        let first = try await Self.ask(harness, Self.q1)
+        harness.session.resetConversation()
+        _ = try await Self.ask(harness, Self.q2(after: first))
+        #expect(!harness.session.lastMetrics.prefixReuse.reused)
+        #expect(!harness.session.lastMetrics.prefixReuse.restoredSnapshot)
+    }
+
+    /// Use actual CPU/Metal recurrence and SWLSTATE bytes as well as the
+    /// history probe: restoring the session's seam must equal a cold render.
+    @Test(arguments: [false, true])
+    func thinkingSnapshotOnRealEnginesMatchesCold(useMetal: Bool) async throws {
+        func makeSession() throws -> SwiftletSession {
+            let folder = Self.fixturesDir.appendingPathComponent("tiny-model-q4")
+            let model: any InferenceModel = useMetal
+                ? try QwenMetalModel(modelDir: folder) : try QwenCPUModel(modelDir: folder)
+            return SwiftletSession(
+                testingModel: model, modelDir: folder,
+                encodeText: { Self.encode($0) },
+                // Decimal ids expose every generated token, including those
+                // which the text fixture's decoder normally hides.
+                decodeTokens: { $0.map(String.init).joined(separator: ",") },
+                renderMessages: { Self.render($0, think: true) }, usesThinkPrompt: true
+            )
+        }
+        func ask(_ session: SwiftletSession, _ messages: [[String: String]]) async throws -> String {
+            var output = ""
+            for try await delta in session.streamChat(messages: messages, maxNew: 4, options: Self.greedy) {
+                output += delta
+            }
+            return output
+        }
+        let warm = try makeSession()
+        let first = try await ask(warm, Self.q1)
+        let transcript = Self.q2(after: first)
+        let resumed = try await ask(warm, transcript)
+        #expect(warm.lastMetrics.prefixReuse.reusedTokens == 43)
+        #expect(warm.lastMetrics.prefixReuse.restoredSnapshot)
+        let cold = try makeSession()
+        #expect(try await ask(cold, transcript) == resumed)
+    }
+
     /// A prompt equal to (or shorter than) what the state holds would need a
     /// rewind; it starts over instead, and produces the same bytes as before.
     @Test func promptThatDoesNotExtendTheStateIsNotReused() async throws {
