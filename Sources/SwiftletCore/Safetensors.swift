@@ -13,17 +13,25 @@ public struct SafetensorsFile {
     private let dataStart: Int
     public private(set) var tensors: [String: TensorInfo] = [:]
 
-    public enum Error: Swift.Error {
-        case malformedHeader
+    public enum Error: Swift.Error, CustomStringConvertible {
+        case malformedHeader(String)
         case missingTensor(String)
         case unsupportedDtype(String, tensor: String)
+
+        public var description: String {
+            switch self {
+            case .malformedHeader(let why): return "malformed safetensors header: \(why)"
+            case .missingTensor(let name): return "missing tensor \(name)"
+            case .unsupportedDtype(let dtype, let name): return "unsupported dtype \(dtype) for tensor \(name)"
+            }
+        }
     }
 
     public init(url: URL) throws {
         // External drives occasionally interrupt the initial map (EINTR);
         // retry briefly before giving up.
         var mapped: Data? = nil
-        var lastError: Swift.Error = Error.malformedHeader
+        var lastError: Swift.Error = Error.malformedHeader("could not read header")
         for attempt in 0..<4 {
             do {
                 mapped = try Data(contentsOf: url, options: .mappedIfSafe)
@@ -35,20 +43,60 @@ public struct SafetensorsFile {
         }
         guard let mapped else { throw lastError }
         data = mapped
-        guard data.count >= 8 else { throw Error.malformedHeader }
-        let headerLen = data.withUnsafeBytes { Int($0.loadUnaligned(fromByteOffset: 0, as: UInt64.self)) }
-        dataStart = 8 + headerLen
-        guard data.count >= dataStart else { throw Error.malformedHeader }
-        let headerJSON = try JSONSerialization.jsonObject(with: data.subdata(in: 8..<dataStart))
-        guard let header = headerJSON as? [String: Any] else { throw Error.malformedHeader }
-        for (name, value) in header where name != "__metadata__" {
-            guard let entry = value as? [String: Any],
-                  let dtype = entry["dtype"] as? String,
-                  let shape = entry["shape"] as? [Int],
-                  let offsets = entry["data_offsets"] as? [Int], offsets.count == 2
-            else { throw Error.malformedHeader }
-            tensors[name] = TensorInfo(dtype: dtype, shape: shape, byteRange: offsets[0]..<offsets[1])
+        guard data.count >= 8 else { throw Error.malformedHeader("header length prefix is shorter than 8 bytes") }
+        let length = data.withUnsafeBytes { UInt64(littleEndian: $0.loadUnaligned(fromByteOffset: 0, as: UInt64.self)) }
+        guard let headerLen = Int(exactly: length) else {
+            throw Error.malformedHeader("header length \(length) does not fit Int")
         }
+        guard headerLen <= data.count - 8 else {
+            throw Error.malformedHeader("header length \(length) exceeds the file's \(data.count - 8) remaining bytes")
+        }
+        dataStart = 8 + headerLen
+        let headerJSON = try JSONSerialization.jsonObject(with: data.subdata(in: 8..<dataStart))
+        guard let header = headerJSON as? [String: Any] else {
+            throw Error.malformedHeader("header JSON is not an object")
+        }
+        for (name, value) in header where name != "__metadata__" {
+            tensors[name] = try Self.tensorInfo(value, name: name, dataSize: data.count - dataStart)
+        }
+    }
+
+    /// Validate untrusted tensor metadata before constructing a range or using
+    /// any shape arithmetic. Also used for headers fetched without the payload.
+    static func tensorInfo(_ value: Any, name: String, dataSize: Int) throws -> TensorInfo {
+        guard let entry = value as? [String: Any],
+              let dtype = entry["dtype"] as? String,
+              let shape = entry["shape"] as? [Int],
+              let offsets = entry["data_offsets"] as? [Int], offsets.count == 2
+        else { throw Error.malformedHeader("tensor \(name): invalid dtype, shape or data_offsets") }
+        let begin = offsets[0], end = offsets[1]
+        guard begin >= 0, end >= begin, end <= dataSize else {
+            throw Error.malformedHeader(
+                "tensor \(name): data_offsets [\(begin), \(end)] must satisfy 0 <= begin <= end <= \(dataSize)")
+        }
+        guard shape.allSatisfy({ $0 >= 0 }) else {
+            throw Error.malformedHeader("tensor \(name): shape \(shape) has a negative dimension")
+        }
+        guard let elementSize = bytesPerElement(dtype) else {
+            throw Error.malformedHeader("tensor \(name): unsupported dtype \(dtype)")
+        }
+        var byteCount = elementSize
+        if shape.contains(0) {
+            byteCount = 0
+        } else {
+            for dimension in shape {
+                let (product, overflow) = byteCount.multipliedReportingOverflow(by: dimension)
+                guard !overflow else {
+                    throw Error.malformedHeader("tensor \(name): dtype \(dtype) × shape \(shape) byte count overflows Int")
+                }
+                byteCount = product
+            }
+        }
+        guard end - begin == byteCount else {
+            throw Error.malformedHeader(
+                "tensor \(name): data_offsets span \(end - begin) bytes, but dtype \(dtype) × shape \(shape) requires \(byteCount)")
+        }
+        return TensorInfo(dtype: dtype, shape: shape, byteRange: begin..<end)
     }
 
     public func info(_ name: String) throws -> TensorInfo {
