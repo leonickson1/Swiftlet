@@ -240,6 +240,11 @@ struct RequestRefusal: Swift.Error, CustomStringConvertible, Equatable {
     let description: String
 }
 
+/// The role/content pairs passed to the session, before rendering or queueing.
+@Sendable func chatMessages(_ request: ChatRequest) -> [[String: String]] {
+    request.messages.map { ["role": $0.role, "content": $0.content.text] }
+}
+
 /// The generation budget a chat request asks for. `max_tokens` wins over
 /// `max_completion_tokens` as before; zero or a negative value in either is
 /// refused by the field's name. Before this, `max_tokens: 0` ran the prompt
@@ -434,7 +439,7 @@ final class HTTPHandler: ChannelInboundHandler {
             respondJSON(context, status: .badRequest, data: jsonData(["error": "malformed request"]))
             return
         }
-        let messages = request.messages.map { ["role": $0.role, "content": $0.content.text] }
+        let messages = chatMessages(request)
         let maxNew: Int
         do {
             maxNew = try requestedMaxNew(request)
