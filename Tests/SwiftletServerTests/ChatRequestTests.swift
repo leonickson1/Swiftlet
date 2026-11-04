@@ -241,6 +241,13 @@ import SwiftletCore
                         #expect(refusal.status == .badRequest)
                         #expect(refusal.description.hasPrefix(field + " "), "the refusal must name the field: \(refusal)")
                         #expect(refusal.description.contains("got \(value)"))
+                        let payload = try #require(JSONSerialization.jsonObject(
+                            with: jsonData(refusal.payload)) as? [String: Any])
+                        let error = try #require(payload["error"] as? [String: String])
+                        #expect(error["message"] == refusal.description)
+                        #expect(error["type"] == "invalid_request_error")
+                        #expect(error["param"] == field)
+                        #expect(error["code"] == "unsupported_value")
                     }
                 }
             }
@@ -281,6 +288,7 @@ import SwiftletCore
                 #expect(refusal.status == .badRequest)
                 #expect(refusal.description.hasPrefix(field + " "), "the refusal must name the field: \(refusal)")
                 #expect(refusal.description.contains("got \(value)"))
+                #expect(refusal.payload["error"] as? String == refusal.description)
             }
         }
     }
