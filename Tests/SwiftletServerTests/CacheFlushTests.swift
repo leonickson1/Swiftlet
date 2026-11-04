@@ -175,9 +175,9 @@ import Testing
                 do {
                     _ = try await URLSession.shared.data(for: streamRequest)
                 } catch let error as URLError {
-                    // An explicit cancellation closes the interrupted SSE
-                    // connection instead of inventing an OpenAI finish reason.
-                    #expect(error.code == .networkConnectionLost)
+                    // EOF can be reported as a lost connection or an
+                    // incomplete chunked response. A timeout is not an end.
+                    #expect(error.code == .networkConnectionLost || error.code == .cannotParseResponse)
                 }
             }
             defer { stream.cancel() }

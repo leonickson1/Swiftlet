@@ -430,14 +430,16 @@ final class HTTPHandler: ChannelInboundHandler {
             // boundary, without blocking NIO's event loop. Acknowledge only
             // after the session has discarded its conversation state.
             let reset = context.eventLoop.makePromise(of: Void.self)
+            let response = NIOLoopBound((self, context), eventLoop: context.eventLoop)
             let session = self.session
             DispatchQueue.global(qos: .userInitiated).async {
                 session.resetConversation()
                 reset.succeed(())
             }
             reset.futureResult.whenSuccess {
-                self.respondJSON(context, status: .ok,
-                                 data: jsonData(["status": "ok", "flushed": true]))
+                let (handler, context) = response.value
+                handler.respondJSON(context, status: .ok,
+                                    data: jsonData(["status": "ok", "flushed": true]))
             }
         default:
             respondJSON(context, status: .notFound, data: jsonData(["error": "not found"]))
@@ -609,7 +611,7 @@ final class HTTPHandler: ChannelInboundHandler {
                             // (strict clients then wait for it forever).
                             let finish = jsonData(completionPayload(
                                 id: id, text: nil, delta: "", finish: finishReason,
-                            usage: (m.promptTokens, m.generatedTokens), model: modelName))
+                                usage: (m.promptTokens, m.generatedTokens), model: modelName))
                             let tail = "data: " + (String(data: finish, encoding: .utf8) ?? "{}")
                                 + "\n\ndata: [DONE]\n\n"
                             var buf = channel.allocator.buffer(capacity: tail.utf8.count)
