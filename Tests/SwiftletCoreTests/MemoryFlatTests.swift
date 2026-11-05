@@ -37,6 +37,11 @@ import Testing
         }
     }
 
+    private final class CacheReference {
+        weak var value: ExpertCache?
+        init(_ value: ExpertCache?) { self.value = value }
+    }
+
     private static func footprint() throws -> UInt64 {
         var info = task_vm_info_data_t()
         var count = mach_msg_type_number_t(
@@ -60,9 +65,9 @@ import Testing
         repacker.log = { _ in }
         try repacker.repack()
         let model = try QwenMetalModel(modelDir: container, cacheBudgetGB: 0.01)
-        let initialCache = try #require(model.expertCache)
-        let smallBytes = 16 * initialCache.stride
-        let largeBytes = 32 * initialCache.stride
+        let stride = try #require(model.expertCache?.stride)
+        let smallBytes = 16 * stride
+        let largeBytes = 32 * stride
         let gb = 1_073_741_824.0
         model.resizeCache(toGB: Double(largeBytes) / gb)
         let state = QwenCPUModel.DecodeState()
@@ -71,10 +76,10 @@ import Testing
         for step in 0..<steps {
             // Alternate the real pressure/relief replacement path: 20 cycles.
             // Only retain the old cache weakly, so the probe cannot leak it.
-            weak var oldCache = model.expertCache
+            let oldCache = CacheReference(model.expertCache)
             let target = step.isMultiple(of: 2) ? smallBytes : largeBytes
             model.resizeCache(toGB: Double(target) / gb)
-            #expect(oldCache == nil, "ExpertCache retained after resizeCache at step \(step)")
+            #expect(oldCache.value == nil, "ExpertCache retained after resizeCache at step \(step)")
             #expect(model.expertCache?.budgetBytes == target, "ExpertCache budget at step \(step)")
             let logits = try model.step([1 + step % 100], state: state)
             #expect(logits.count == model.config.vocabSize)
@@ -104,7 +109,16 @@ import Testing
         defer { try? handle.close() }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
-        process.arguments = ["--testing-library", "swift-testing", "--filter", "MemoryFlatTests/\(test)"]
+        // Newer SwiftPM uses a separate swift-testing executable and passes
+        // the test bundle as an argument. Preserve those loader arguments.
+        var arguments = Array(CommandLine.arguments.dropFirst())
+        while let index = arguments.firstIndex(of: "--filter") {
+            arguments.remove(at: index)
+            if index < arguments.count { arguments.remove(at: index) }
+        }
+        arguments += ["--filter", "MemoryFlatTests/\(test)"]
+        process.arguments = arguments
+        print("MEMORY_FLAT_CHILD_COMMAND \(CommandLine.arguments[0]) \(arguments)")
         var environment = ProcessInfo.processInfo.environment
         environment[childKey] = test
         process.environment = environment
