@@ -589,27 +589,35 @@ public final class StreamingInstaller {
             return ShardHeader(fileSize: size, dataStart: ds, tensors: f.tensors)
         case .huggingFace, .baseURL:
             guard let first = try ranged(shard, 0..<8) else { throw Error.missingFile(shard) }
-            let headerLen = first.withUnsafeBytes { Int($0.loadUnaligned(fromByteOffset: 0, as: UInt64.self)) }
-            guard let headerData = try ranged(shard, 8..<(8 + headerLen)) else { throw Error.badHeader(shard) }
-            guard let obj = try JSONSerialization.jsonObject(with: headerData) as? [String: Any] else {
-                throw Error.badHeader(shard)
+            let length = first.data.withUnsafeBytes {
+                UInt64(littleEndian: $0.loadUnaligned(fromByteOffset: 0, as: UInt64.self))
+            }
+            guard let headerLen = Int(exactly: length) else {
+                throw Error.badHeader("\(shard): header length \(length) does not fit Int")
+            }
+            guard headerLen > 0, headerLen <= first.fileSize - 8 else {
+                throw Error.badHeader("\(shard): header length \(length) exceeds the file's \(first.fileSize - 8) remaining bytes or is empty")
+            }
+            let dataStart = 8 + headerLen
+            guard let header = try ranged(shard, 8..<dataStart), header.fileSize == first.fileSize else {
+                throw Error.badHeader("\(shard): header bytes are missing or the file size changed")
+            }
+            guard let obj = try JSONSerialization.jsonObject(with: header.data) as? [String: Any] else {
+                throw Error.badHeader("\(shard): header JSON is not an object")
             }
             var tensors: [String: SafetensorsFile.TensorInfo] = [:]
-            var maxEnd = 0
-            for (name, v) in obj where name != "__metadata__" {
-                guard let e = v as? [String: Any],
-                      let dtype = e["dtype"] as? String,
-                      let shape = e["shape"] as? [Int],
-                      let offs = e["data_offsets"] as? [Int], offs.count == 2
-                else { throw Error.badHeader(shard) }
-                tensors[name] = SafetensorsFile.TensorInfo(dtype: dtype, shape: shape, byteRange: offs[0]..<offs[1])
-                maxEnd = max(maxEnd, offs[1])
+            for (name, value) in obj where name != "__metadata__" {
+                do {
+                    tensors[name] = try SafetensorsFile.tensorInfo(value, name: name, dataSize: first.fileSize - dataStart)
+                } catch SafetensorsFile.Error.malformedHeader(let why) {
+                    throw Error.badHeader("\(shard): \(why)")
+                }
             }
-            return ShardHeader(fileSize: 8 + headerLen + maxEnd, dataStart: 8 + headerLen, tensors: tensors)
+            return ShardHeader(fileSize: first.fileSize, dataStart: dataStart, tensors: tensors)
         }
     }
 
-    private func ranged(_ file: String, _ range: Range<Int>) throws -> Data? {
+    private func ranged(_ file: String, _ range: Range<Int>) throws -> (data: Data, fileSize: Int)? {
         guard let base = source.httpBase else { return nil }
         let url = URL(string: "\(base)/\(file)")!
         var req = URLRequest(url: url)
@@ -617,14 +625,31 @@ public final class StreamingInstaller {
         req.timeoutInterval = 60
         StreamingInstaller.authorize(&req)
         let sem = DispatchSemaphore(value: 0)
-        var result: Data?
+        var result: (data: Data, response: HTTPURLResponse)?
         URLSession.shared.dataTask(with: req) { d, r, _ in
-            let code = (r as? HTTPURLResponse)?.statusCode ?? 0
-            result = (code == 206 || code == 200) ? d : nil
+            if let d, let response = r as? HTTPURLResponse,
+               response.statusCode == 206 || response.statusCode == 200 {
+                result = (d, response)
+            }
             sem.signal()
         }.resume()
         sem.wait()
-        return result
+        guard let result else { return nil }
+        // A partial response's Content-Length is only the range length. The
+        // Content-Range total bounds tensor offsets against the shard itself,
+        // independently of what its untrusted JSON header claims.
+        guard result.response.statusCode == 206,
+              let contentRange = result.response.value(forHTTPHeaderField: "Content-Range") else {
+            throw Error.badHeader("\(file): header range requires HTTP 206 with a Content-Range file size")
+        }
+        let parts = contentRange.split(separator: "/", omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              parts[0] == "bytes \(range.lowerBound)-\(range.upperBound - 1)",
+              let fileSize = Int(parts[1]), fileSize >= range.upperBound,
+              result.data.count == range.count else {
+            throw Error.badHeader("\(file): invalid Content-Range \(contentRange) or header response length \(result.data.count)")
+        }
+        return (result.data, fileSize)
     }
 
     /// Streams shard bytes from `offset`, delivering chunks in order. Retries
