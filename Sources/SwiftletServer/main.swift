@@ -77,6 +77,8 @@ struct ChatRequest: Decodable {
     struct Message: Decodable { let role: String; let content: ChatContent }
     let messages: [Message]
     let stream: Bool?
+    let n: Int?
+    let best_of: Int?
     let max_tokens: Int?
     let max_completion_tokens: Int?
     let temperature: Float?
@@ -238,16 +240,36 @@ enum RequestLimits {
 struct RequestRefusal: Swift.Error, CustomStringConvertible, Equatable {
     let status: HTTPResponseStatus
     let description: String
+    var param: String? = nil
+
+    var payload: [String: Any] {
+        guard let param else { return ["error": description] }
+        return ["error": [
+            "message": description,
+            "type": "invalid_request_error",
+            "param": param,
+            "code": "unsupported_value",
+        ]]
+    }
 }
 
 /// The generation budget a chat request asks for. `max_tokens` wins over
 /// `max_completion_tokens` as before; zero or a negative value in either is
-/// refused by the field's name. Before this, `max_tokens: 0` ran the prompt
+/// refused by the field's name. `n` and `best_of` can only be 1: the server
+/// has one conversation and one sampler row, so other values are refused
+/// here too. Before this, `max_tokens: 0` ran the prompt
 /// through prefill and returned an empty completion with `finish_reason:
 /// "length"`, and a negative value reached `ContextWindow`, whose refusal
 /// named `requestedMaxNew` (an internal parameter) after the prompt had been
 /// rendered and, on a streaming request, after the 200 head was on the wire.
 @Sendable func requestedMaxNew(_ request: ChatRequest) throws -> Int {
+    for (field, value) in [("n", request.n), ("best_of", request.best_of)] {
+        if let value, value != 1 {
+            throw RequestRefusal(
+                status: .badRequest,
+                description: "\(field) must be 1, got \(value)", param: field)
+        }
+    }
     for (field, value) in [("max_tokens", request.max_tokens),
                            ("max_completion_tokens", request.max_completion_tokens)] {
         if let value, value <= 0 {
@@ -442,7 +464,7 @@ final class HTTPHandler: ChannelInboundHandler {
             // Decided here, before the prompt is rendered or queued behind
             // another generation, so a streaming request gets a real 400
             // rather than an error event after a 200 head.
-            respondJSON(context, status: refusal.status, data: jsonData(["error": refusal.description]))
+            respondJSON(context, status: refusal.status, data: jsonData(refusal.payload))
             return
         } catch {
             respondJSON(context, status: .badRequest, data: jsonData(["error": "malformed request"]))
