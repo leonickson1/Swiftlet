@@ -99,6 +99,14 @@ swift build -c release
 .build/release/swiftlet generate ~/models/qwen3.6-35b.qpack \
   --gpu --chat --prompt "Explain expert streaming in one paragraph."
 
+# Save the conversation state (KV, DeltaNet recurrence, position) and resume
+# it later in a new process, continuing exactly from the saved state
+# (docs/STATE_FORMAT.md):
+.build/release/swiftlet generate ~/models/qwen3.6-35b.qpack \
+  --gpu --prompt "The fieldfare is a bird that" --save-state /tmp/s.swlstate
+.build/release/swiftlet generate ~/models/qwen3.6-35b.qpack \
+  --gpu --prompt " It" --load-state /tmp/s.swlstate
+
 # OpenAI-compatible server (loopback only):
 .build/release/swiftlet-server --model ~/models/qwen3.6-35b.qpack --port 8080
 ```
@@ -144,6 +152,15 @@ routes every token to 10 of 512 experts (80B) or 8 of 256 (35B). Swiftlet:
 75 percent of the layers use Gated DeltaNet linear attention with a
 fixed-size recurrent state, so there is no growing KV cache for those layers
 at any context length.
+
+Chat sessions reuse the live state when its fed token ids match the next
+prompt. They also keep one in-memory snapshot after the assistant header,
+before the think block, so a follow-up whose template re-renders that block
+can restore the matching prefix and prefill the remainder. Set
+`SWIFTLET_PREFIX_LOG=1` for the live and snapshot follow counts and escaped
+text at the stopping point; the full diagnostic is also in
+`lastMetrics.prefixReuse.reason`. `SWIFTLET_KV_PREFIX=0` disables both forms
+of reuse for a cold-prefill comparison.
 
 ## Four ways to use it
 

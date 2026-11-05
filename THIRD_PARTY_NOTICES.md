@@ -11,7 +11,9 @@ Swiftlet builds on the work of several open-source projects.
   `.gturbo` format and runtime.
 - **colibrì** (Apache 2.0), https://github.com/JustVugg/colibri: cache and
   placement policies (learned pinning, router-lookahead prefetch, batch-union
-  prefill) and the correctness-first measurement discipline.
+  prefill) and the correctness-first measurement discipline. The answer-start
+  snapshot rule follows PR #2517, commit `d175038c6a9e` (`c/qwen38.c`);
+  no C implementation is copied.
 
 ## Reference implementations
 
@@ -29,6 +31,11 @@ Swiftlet builds on the work of several open-source projects.
 - **swift-nio** (Apache 2.0), Apple Inc.: the loopback HTTP server.
 
 ## Model weights
+
+`fixtures/prompt-snapshot-tokenizer/` contains Qwen3.6 tokenizer metadata
+from Alibaba's Qwen team (Apache 2.0): the chat template and tokenizer
+configuration, and a reduced vocabulary/merge table for the header test.
+Its README records the source and reductions. No model weights are included.
 
 Model weights are not distributed with this project. The Qwen3-Next and
 Qwen3.5/3.6 checkpoints are released by Alibaba's Qwen team under Apache 2.0;
