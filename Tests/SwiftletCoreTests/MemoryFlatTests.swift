@@ -125,9 +125,16 @@ import Testing
         process.standardOutput = handle
         process.standardError = handle
         try process.run()
+        let deadline = Date().addingTimeInterval(60)
+        while process.isRunning, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        let timedOut = process.isRunning
+        if timedOut { process.terminate() }
         process.waitUntilExit()
         let output = try String(contentsOf: log, encoding: .utf8)
         print(output)
+        #expect(!timedOut, "memory-flat child exceeded 60 seconds: \(test)")
         #expect(process.terminationStatus == 0, "memory-flat child failed: \(test)")
         #expect(output.contains("MEMORY_FLAT_CHILD_COMPLETED \(test)"),
                 "memory-flat child did not execute \(test)")
@@ -135,11 +142,19 @@ import Testing
 
     @Test func decodeAndCacheReplacementsStayFlat() throws {
         try Self.inChild("decodeAndCacheReplacementsStayFlat") {
-            // RED: deliberately inject the leak to prove this assertion fails.
-            let trace = try Self.measure(leaking: true)
+            let trace = try Self.measure(leaking: false)
             print("MEMORY_FLAT_RESULT baseline=\(trace.baseline) peak=\(trace.peak) bound=\(Self.boundBytes)")
             #expect(!trace.exceedsBound,
                     "phys_footprint grew beyond 32 MiB after step 7: baseline=\(trace.baseline), peak=\(trace.peak)")
+        }
+    }
+
+    @Test func retainedMetalBufferPerStepExceedsTheSameBound() throws {
+        try Self.inChild("retainedMetalBufferPerStepExceedsTheSameBound") {
+            let trace = try Self.measure(leaking: true)
+            print("MEMORY_FLAT_LEAK_CONTROL baseline=\(trace.baseline) peak=\(trace.peak) bound=\(Self.boundBytes)")
+            #expect(trace.exceedsBound,
+                    "phys_footprint bound missed a retained, touched 16 MiB MTLBuffer per step")
         }
     }
 }
