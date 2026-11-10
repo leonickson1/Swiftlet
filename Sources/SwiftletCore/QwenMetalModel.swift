@@ -597,10 +597,15 @@ public final class QwenMetalModel {
         // pressure valve must refuse such a request, not crash on it.
         let bytes = gb * 1_073_741_824
         guard bytes >= 0, let budget = Int(exactly: bytes.rounded(.down)) else { return }
-        guard let replacement = try? ExpertCache(
-            containerDir: ckpt.dir, device: engine.device, budgetBytes: budget
-        ) else { return }
-        expertCache = replacement
+        // Opening the replacement autoreleases its reader's file and JSON
+        // objects; drain them here rather than in the caller's pool, which a
+        // generation does not empty before its request ends.
+        autoreleasepool {
+            guard let replacement = try? ExpertCache(
+                containerDir: ckpt.dir, device: engine.device, budgetBytes: budget
+            ) else { return }
+            expertCache = replacement
+        }
     }
 
     /// The original name of `resizeCache(toGB:)`, kept for callers that only
@@ -989,10 +994,19 @@ public final class QwenMetalModel {
             let wanted = min(max(1, chunkTokens), tokens.count)
             if ensurePrefillCapacity(wanted) { chunkCapacity = wanted }
         }
+        // What a step autoreleases (Metal hands out command buffers and
+        // encoders that way) keeps the buffers the step bound alive. A
+        // generation is one dispatch work item, and its pool empties no
+        // earlier than the end of that item (only once the queue goes idle
+        // when requests arrive back to back), so without a pool per step an
+        // expert cache replaced between tokens -- the memory-pressure valve
+        // -- would keep every slot resident for the rest of the request.
         if chunkCapacity > 0 {
-            logits = try prefillLayerMajor(
-                tokens, state: state, chunkCapacity: chunkCapacity, shouldCancel: shouldCancel
-            )
+            logits = try autoreleasepool {
+                try prefillLayerMajor(
+                    tokens, state: state, chunkCapacity: chunkCapacity, shouldCancel: shouldCancel
+                )
+            }
         } else {
             for (index, t) in tokens.enumerated() {
                 try checkGenerationCancellation(shouldCancel)
@@ -1000,9 +1014,11 @@ public final class QwenMetalModel {
                 // final position's logits, so intermediate vocabulary
                 // projections are unnecessary.
                 let projectLogits = index == tokens.count - 1
-                logits = try stepOne(
-                    t, state: state, projectLogits: projectLogits, shouldCancel: shouldCancel
-                )
+                logits = try autoreleasepool {
+                    try stepOne(
+                        t, state: state, projectLogits: projectLogits, shouldCancel: shouldCancel
+                    )
+                }
                 state.position += 1
                 counters.tokensProcessed += 1
                 try checkGenerationCancellation(shouldCancel)
