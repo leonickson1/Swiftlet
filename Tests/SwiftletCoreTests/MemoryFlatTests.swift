@@ -5,23 +5,26 @@ import Metal
 import Testing
 @testable import SwiftletCore
 
-/// Redmine #52584: the test idea from strata 061c5420 and ds4 381808d.
-/// No donor code copied. Keep the process footprint independent of other
-/// suites, which Swift Testing may run concurrently in the parent process.
+/// The test idea from strata 061c5420 and ds4 381808d; no donor code copied.
+/// Keep the process footprint independent of other suites, which Swift
+/// Testing may run concurrently in the parent process.
 @Suite struct MemoryFlatTests {
     private static let steps = 40
     private static let baselineStep = 7
-    private static let boundBytes: UInt64 = 32 * 1_048_576
     private static let childKey = "SWIFTLET_MEMORY_FLAT_CHILD"
 
     private struct Trace {
         let samples: [UInt64]
+        /// Two full expert caches (ds4's shape: twice what one step
+        /// allocates). Every step replaces the cache, so a replaced cache
+        /// that stays resident adds its slots per step and crosses this
+        /// within a few steps; the fixture's whole cache is far below the
+        /// megabytes a bound borrowed from a larger workload would allow.
+        let bound: UInt64
 
         var baseline: UInt64 { samples[MemoryFlatTests.baselineStep] }
         var peak: UInt64 { samples[(MemoryFlatTests.baselineStep + 1)...].max()! }
-        var exceedsBound: Bool {
-            peak > baseline && peak - baseline > MemoryFlatTests.boundBytes
-        }
+        var exceedsBound: Bool { peak > baseline && peak - baseline > bound }
     }
 
     /// A retained shared buffer is invisible to ordinary Swift heap counters.
@@ -29,9 +32,9 @@ import Testing
     private final class LeakingStep {
         private var retained: [MTLBuffer] = []
 
-        func step(device: MTLDevice) throws {
+        func step(device: MTLDevice, length: Int) throws {
             let buffer = try #require(device.makeBuffer(
-                length: 16 * 1_048_576, options: .storageModeShared))
+                length: length, options: .storageModeShared))
             memset(buffer.contents(), 0x5a, buffer.length)
             retained.append(buffer)
         }
@@ -85,12 +88,16 @@ import Testing
             #expect(logits.count == model.config.vocabSize)
             #expect(model.lastStepMetrics.commandBufferErrors == 0)
             #expect(model.expertCache!.allocatedSlots > 0, "ExpertCache slots were not exercised")
-            if leaking { try leak.step(device: model.engine.device) }
+            // The control keeps one full cache's worth of touched pages per
+            // step: the size of the leak the bound exists to catch.
+            if leaking { try leak.step(device: model.engine.device, length: largeBytes) }
             let sample = try footprint()
             samples.append(sample)
             print("MEMORY_FLAT_SAMPLE step=\(step) phys_footprint=\(sample)")
         }
-        return withExtendedLifetime(leak) { Trace(samples: samples) }
+        return withExtendedLifetime(leak) {
+            Trace(samples: samples, bound: UInt64(2 * largeBytes))
+        }
     }
 
     /// Re-enter only this test in a fresh process. A suite's .serialized trait
@@ -143,18 +150,18 @@ import Testing
     @Test func decodeAndCacheReplacementsStayFlat() throws {
         try Self.inChild("decodeAndCacheReplacementsStayFlat") {
             let trace = try Self.measure(leaking: false)
-            print("MEMORY_FLAT_RESULT baseline=\(trace.baseline) peak=\(trace.peak) bound=\(Self.boundBytes)")
+            print("MEMORY_FLAT_RESULT baseline=\(trace.baseline) peak=\(trace.peak) bound=\(trace.bound)")
             #expect(!trace.exceedsBound,
-                    "phys_footprint grew beyond 32 MiB after step 7: baseline=\(trace.baseline), peak=\(trace.peak)")
+                    "phys_footprint grew beyond two expert caches (\(trace.bound) bytes) after step 7: baseline=\(trace.baseline), peak=\(trace.peak)")
         }
     }
 
     @Test func retainedMetalBufferPerStepExceedsTheSameBound() throws {
         try Self.inChild("retainedMetalBufferPerStepExceedsTheSameBound") {
             let trace = try Self.measure(leaking: true)
-            print("MEMORY_FLAT_LEAK_CONTROL baseline=\(trace.baseline) peak=\(trace.peak) bound=\(Self.boundBytes)")
+            print("MEMORY_FLAT_LEAK_CONTROL baseline=\(trace.baseline) peak=\(trace.peak) bound=\(trace.bound)")
             #expect(trace.exceedsBound,
-                    "phys_footprint bound missed a retained, touched 16 MiB MTLBuffer per step")
+                    "phys_footprint bound missed one retained, touched cache-sized MTLBuffer per step")
         }
     }
 }
