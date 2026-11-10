@@ -922,6 +922,23 @@ public final class QwenMetalModel {
         state: QwenCPUModel.DecodeState,
         shouldCancel: () -> Bool
     ) throws -> [Float] {
+        // What a step autoreleases (Metal hands out command buffers and
+        // encoders that way) keeps the buffers the step bound alive. A
+        // generation is one dispatch work item, and its pool empties no
+        // earlier than the end of that item (only once the queue goes idle
+        // when requests arrive back to back), so without a pool per call an
+        // expert cache replaced between tokens -- the memory-pressure valve
+        // -- would keep every slot resident for the rest of the request.
+        try autoreleasepool {
+            try stepInPool(tokens, state: state, shouldCancel: shouldCancel)
+        }
+    }
+
+    private func stepInPool(
+        _ tokens: [Int],
+        state: QwenCPUModel.DecodeState,
+        shouldCancel: () -> Bool
+    ) throws -> [Float] {
         let counters = StepCounters()
         if case .dispatchBoundaryCounters = phaseGpuSplitSupport {
             counters.phaseGpuSeconds = [:]
@@ -994,19 +1011,10 @@ public final class QwenMetalModel {
             let wanted = min(max(1, chunkTokens), tokens.count)
             if ensurePrefillCapacity(wanted) { chunkCapacity = wanted }
         }
-        // What a step autoreleases (Metal hands out command buffers and
-        // encoders that way) keeps the buffers the step bound alive. A
-        // generation is one dispatch work item, and its pool empties no
-        // earlier than the end of that item (only once the queue goes idle
-        // when requests arrive back to back), so without a pool per step an
-        // expert cache replaced between tokens -- the memory-pressure valve
-        // -- would keep every slot resident for the rest of the request.
         if chunkCapacity > 0 {
-            logits = try autoreleasepool {
-                try prefillLayerMajor(
-                    tokens, state: state, chunkCapacity: chunkCapacity, shouldCancel: shouldCancel
-                )
-            }
+            logits = try prefillLayerMajor(
+                tokens, state: state, chunkCapacity: chunkCapacity, shouldCancel: shouldCancel
+            )
         } else {
             for (index, t) in tokens.enumerated() {
                 try checkGenerationCancellation(shouldCancel)
@@ -1014,11 +1022,9 @@ public final class QwenMetalModel {
                 // final position's logits, so intermediate vocabulary
                 // projections are unnecessary.
                 let projectLogits = index == tokens.count - 1
-                logits = try autoreleasepool {
-                    try stepOne(
-                        t, state: state, projectLogits: projectLogits, shouldCancel: shouldCancel
-                    )
-                }
+                logits = try stepOne(
+                    t, state: state, projectLogits: projectLogits, shouldCancel: shouldCancel
+                )
                 state.position += 1
                 counters.tokensProcessed += 1
                 try checkGenerationCancellation(shouldCancel)
