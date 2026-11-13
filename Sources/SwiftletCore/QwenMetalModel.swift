@@ -600,6 +600,9 @@ public final class QwenMetalModel {
         guard let replacement = try? ExpertCache(
             containerDir: ckpt.dir, device: engine.device, budgetBytes: budget
         ) else { return }
+        replacement.trace = expertCache?.trace
+        replacement.bypassPageCache = expertCache?.bypassPageCache ?? false
+        replacement.policy = expertCache?.policy ?? .lru
         expertCache = replacement
     }
 

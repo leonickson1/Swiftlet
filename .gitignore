@@ -8,3 +8,5 @@ DerivedData/
 .DS_Store
 *.qpack/
 .install-progress.json
+WORKING-NOTES.md
+__pycache__/

@@ -434,6 +434,23 @@ public final class QpackExpertReader {
     public let layout: Qpack.Layout
     private let dir: URL
     private var fds: [Int32]
+    /// Read-only mappings of the layer files for `pageCacheResidentFraction`,
+    /// created on first probe and never dereferenced, so they cost address
+    /// space and nothing else. Nil until probed; a failed map is remembered.
+    private var probeMaps: [UnsafeMutableRawPointer?]
+    private var probeMapLengths: [Int]
+    private var probeMapFailed: [Bool]
+    /// Reads skip the kernel's unified buffer cache (F_NOCACHE): what a miss
+    /// reads is not kept, so the next miss on the same blob goes to the
+    /// device again. An experiment control (docs/CACHE_SUITE.md) emulating a
+    /// machine whose RAM cannot hold the expert file; pages the cache already
+    /// held still answer, so pair it with a purge. Applies to open files too.
+    public var bypassPageCache = false {
+        didSet {
+            guard bypassPageCache != oldValue else { return }
+            for fd in fds where fd >= 0 { _ = fcntl(fd, F_NOCACHE, bypassPageCache ? 1 : 0) }
+        }
+    }
 
     public init(containerDir: URL) throws {
         dir = containerDir.appendingPathComponent("packed_experts")
@@ -449,9 +466,17 @@ public final class QpackExpertReader {
             layout = try JSONDecoder().decode(Qpack.Layout.self, from: layoutData)
         }
         fds = Array(repeating: -1, count: layout.layerCount)
+        probeMaps = Array(repeating: nil, count: layout.layerCount)
+        probeMapLengths = Array(repeating: 0, count: layout.layerCount)
+        probeMapFailed = Array(repeating: false, count: layout.layerCount)
     }
 
-    deinit { for fd in fds where fd >= 0 { close(fd) } }
+    deinit {
+        for fd in fds where fd >= 0 { close(fd) }
+        for (layer, map) in probeMaps.enumerated() {
+            if let map { munmap(map, probeMapLengths[layer]) }
+        }
+    }
 
     /// Single-pread fetch of one expert blob into a caller-provided buffer of
     /// at least `layout.expertStride` bytes.
@@ -468,27 +493,126 @@ public final class QpackExpertReader {
     public func readExperts(
         layer: Int, _ requests: [(expert: Int, into: UnsafeMutableRawPointer)]
     ) throws {
+        try readAll(layer: layer, requests, timings: nil)
+    }
+
+    /// `readExperts` plus each request's own pread wall time, in request
+    /// order. Concurrent reads overlap, so the sum is not the batch's wall
+    /// time; it is the per-blob cost the fetch trace wants. Two clock reads
+    /// per blob, otherwise the same code path as `readExperts`.
+    public func readExpertsTimed(
+        layer: Int, _ requests: [(expert: Int, into: UnsafeMutableRawPointer)]
+    ) throws -> [Double] {
+        guard !requests.isEmpty else { return [] }
+        let timings = UnsafeMutableBufferPointer<Double>.allocate(capacity: requests.count)
+        defer { timings.deallocate() }
+        timings.initialize(repeating: 0)
+        try readAll(layer: layer, requests, timings: timings)
+        return Array(timings)
+    }
+
+    private func readAll(
+        layer: Int, _ requests: [(expert: Int, into: UnsafeMutableRawPointer)],
+        timings: UnsafeMutableBufferPointer<Double>?
+    ) throws {
         guard !requests.isEmpty else { return }
         let fd = try descriptor(layer: layer)
         let stride = layout.expertStride
+        // Distinct destinations and distinct timing slots per iteration, so
+        // handing the batch to the concurrent closure as one value is sound.
+        let batch = Batch(requests: requests, timings: timings?.baseAddress)
         if requests.count == 1 {
             try Self.readBlob(fd, layer: layer, expert: requests[0].expert, stride: stride,
-                           into: requests[0].into)
+                              into: requests[0].into, timing: batch.timings)
             return
         }
-        let lock = NSLock()
-        var failure: Swift.Error?
+        let failure = FirstError()
         DispatchQueue.concurrentPerform(iterations: requests.count) { i in
             do {
-                try Self.readBlob(fd, layer: layer, expert: requests[i].expert, stride: stride,
-                               into: requests[i].into)
+                try Self.readBlob(fd, layer: layer, expert: batch.requests[i].expert, stride: stride,
+                                  into: batch.requests[i].into, timing: batch.timings.map { $0 + i })
             } catch {
-                lock.lock()
-                if failure == nil { failure = error }
-                lock.unlock()
+                failure.record(error)
             }
         }
-        if let failure { throw failure }
+        if let error = failure.error { throw error }
+    }
+
+    /// One concurrent read batch: every iteration touches only its own
+    /// destination and its own timing slot.
+    private struct Batch: @unchecked Sendable {
+        let requests: [(expert: Int, into: UnsafeMutableRawPointer)]
+        let timings: UnsafeMutablePointer<Double>?
+    }
+
+    /// First error out of a concurrent batch, lock protected.
+    private final class FirstError: @unchecked Sendable {
+        private let lock = NSLock()
+        private var stored: Swift.Error?
+
+        func record(_ error: Swift.Error) {
+            lock.lock()
+            if stored == nil { stored = error }
+            lock.unlock()
+        }
+
+        var error: Swift.Error? {
+            lock.lock()
+            defer { lock.unlock() }
+            return stored
+        }
+    }
+
+    /// Whether the layer files can be mapped for page cache probing.
+    public var pageCacheProbeAvailable: Bool {
+        layout.layerCount > 0 && probeMapping(layer: 0) != nil
+    }
+
+    /// Share of one expert blob's pages the page cache holds right now, from
+    /// 0 to 1, or nil when the layer file cannot be mapped or the request is
+    /// out of range. A read-only MAP_SHARED mapping plus mincore(2): neither
+    /// faults a page in, so the probe does not disturb what it measures. The
+    /// answer is a snapshot; the fetch trace takes it the instant before the
+    /// blob's pread, which is the moment that decides whether the pread is a
+    /// copy or an I/O.
+    public func pageCacheResidentFraction(layer: Int, expert: Int) -> Double? {
+        guard layer >= 0, layer < layout.layerCount, expert >= 0,
+              let base = probeMapping(layer: layer) else { return nil }
+        let stride = layout.expertStride
+        let begin = expert * stride
+        let end = begin + stride
+        guard end <= probeMapLengths[layer] else { return nil }
+        let pageSize = Int(getpagesize())
+        let alignedBegin = begin - begin % pageSize
+        let length = end - alignedBegin
+        let pages = (length + pageSize - 1) / pageSize
+        var vec = [CChar](repeating: 0, count: pages)
+        let rc = vec.withUnsafeMutableBufferPointer { mincore(base + alignedBegin, length, $0.baseAddress) }
+        guard rc == 0 else { return nil }
+        let resident = vec.reduce(0) { $0 + (($1 & CChar(MINCORE_INCORE)) != 0 ? 1 : 0) }
+        return Double(resident) / Double(pages)
+    }
+
+    private func probeMapping(layer: Int) -> UnsafeMutableRawPointer? {
+        if let map = probeMaps[layer] { return map }
+        if probeMapFailed[layer] { return nil }
+        guard let fd = try? descriptor(layer: layer) else {
+            probeMapFailed[layer] = true
+            return nil
+        }
+        var info = stat()
+        guard fstat(fd, &info) == 0, info.st_size > 0 else {
+            probeMapFailed[layer] = true
+            return nil
+        }
+        let length = Int(info.st_size)
+        guard let map = mmap(nil, length, PROT_READ, MAP_SHARED, fd, 0), map != MAP_FAILED else {
+            probeMapFailed[layer] = true
+            return nil
+        }
+        probeMaps[layer] = map
+        probeMapLengths[layer] = length
+        return map
     }
 
     private func descriptor(layer: Int) throws -> Int32 {
@@ -496,15 +620,21 @@ public final class QpackExpertReader {
             let path = dir.appendingPathComponent(String(format: "layer_%02d.bin", layer)).path
             let fd = open(path, O_RDONLY)
             guard fd >= 0 else { throw Checkpoint.Error.missingTensor(path) }
+            if bypassPageCache { _ = fcntl(fd, F_NOCACHE, 1) }
             fds[layer] = fd
         }
         return fds[layer]
     }
 
+    /// One pread. With `timing`, its wall time lands there (two clock reads;
+    /// nothing else changes).
     private static func readBlob(
-        _ fd: Int32, layer: Int, expert: Int, stride: Int, into buffer: UnsafeMutableRawPointer
+        _ fd: Int32, layer: Int, expert: Int, stride: Int, into buffer: UnsafeMutableRawPointer,
+        timing: UnsafeMutablePointer<Double>? = nil
     ) throws {
+        let started = timing == nil ? 0 : ProcessInfo.processInfo.systemUptime
         let n = pread(fd, buffer, stride, off_t(expert * stride))
+        if let timing { timing.pointee = ProcessInfo.processInfo.systemUptime - started }
         guard n == stride else {
             throw Checkpoint.Error.badShape("short read: layer \(layer) expert \(expert)")
         }

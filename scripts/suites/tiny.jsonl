@@ -1,0 +1,5 @@
+# Smoke suite for the tiny fixture model (no chat template, 512-token window).
+{"id": "tiny-0", "category": "a", "max_new": 24, "prompt": "hello world", "check": {"type": "open"}}
+{"id": "tiny-1", "category": "b", "max_new": 24, "prompt": "the cat sat", "check": {"type": "open"}}
+{"id": "tiny-2", "category": "a", "max_new": 24, "prompt": "hello there", "check": {"type": "open"}}
+{"id": "tiny-3", "category": "c", "max_new": 24, "prompt": "one two three", "check": {"type": "open"}}
