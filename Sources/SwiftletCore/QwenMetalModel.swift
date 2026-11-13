@@ -1080,7 +1080,7 @@ public final class QwenMetalModel {
         }
         let qOut = readY(0, qOutDim)
         var k = readY(qOutDim, kvDim)
-        var v = readY(qOutDim + kvDim, kvDim)
+        let v = readY(qOutDim + kvDim, kvDim)
 
         var q = [Float](repeating: 0, count: H * hd)
         var gate = [Float](repeating: 0, count: H * hd)
