@@ -597,10 +597,15 @@ public final class QwenMetalModel {
         // pressure valve must refuse such a request, not crash on it.
         let bytes = gb * 1_073_741_824
         guard bytes >= 0, let budget = Int(exactly: bytes.rounded(.down)) else { return }
-        guard let replacement = try? ExpertCache(
-            containerDir: ckpt.dir, device: engine.device, budgetBytes: budget
-        ) else { return }
-        expertCache = replacement
+        // Opening the replacement autoreleases its reader's file and JSON
+        // objects; drain them here rather than in the caller's pool, which a
+        // generation does not empty before its request ends.
+        autoreleasepool {
+            guard let replacement = try? ExpertCache(
+                containerDir: ckpt.dir, device: engine.device, budgetBytes: budget
+            ) else { return }
+            expertCache = replacement
+        }
     }
 
     /// The original name of `resizeCache(toGB:)`, kept for callers that only
@@ -913,6 +918,23 @@ public final class QwenMetalModel {
     /// Cancellation exits by throwing, so StepMetrics is published through the
     /// same `defer` as any other failure with `completedWithoutThrow == false`.
     public func step(
+        _ tokens: [Int],
+        state: QwenCPUModel.DecodeState,
+        shouldCancel: () -> Bool
+    ) throws -> [Float] {
+        // What a step autoreleases (Metal hands out command buffers and
+        // encoders that way) keeps the buffers the step bound alive. A
+        // generation is one dispatch work item, and its pool empties no
+        // earlier than the end of that item (only once the queue goes idle
+        // when requests arrive back to back), so without a pool per call an
+        // expert cache replaced between tokens -- the memory-pressure valve
+        // -- would keep every slot resident for the rest of the request.
+        try autoreleasepool {
+            try stepInPool(tokens, state: state, shouldCancel: shouldCancel)
+        }
+    }
+
+    private func stepInPool(
         _ tokens: [Int],
         state: QwenCPUModel.DecodeState,
         shouldCancel: () -> Bool
