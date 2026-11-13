@@ -62,6 +62,8 @@ public final class StreamingInstaller {
         case missingFile(String)
         case badHeader(String)
         case httpError(String, Int)
+        case badContentRange(expected: String, got: String)
+        case rangeNotHonored(range: String, status: Int)
         case ioError(String)
         case hashMismatch(String)
         case cancelled
@@ -72,6 +74,10 @@ public final class StreamingInstaller {
             case .missingFile(let f): return "missing file \(f)"
             case .badHeader(let f): return "unreadable header in \(f)"
             case .httpError(let f, let c): return "network error \(c) on \(f)"
+            case .badContentRange(let expected, let got):
+                return "resume refused: Content-Range \(got); expected \(expected)"
+            case .rangeNotHonored(let range, let status):
+                return "Range \(range) refused: server answered HTTP \(status), expected 206"
             case .ioError(let f): return "could not write \(f)"
             case .hashMismatch(let f): return "integrity check failed for \(f)"
             case .cancelled: return "cancelled"
@@ -387,7 +393,7 @@ public final class StreamingInstaller {
             }
             log("\(plan.name): streaming from byte \(done) of \(plan.size)")
             var cursor = done
-            try streamShard(plan.name, from: done) { chunk in
+            try streamShard(plan.name, from: done, expectedSize: plan.size) { chunk in
                 try self.route(chunk: chunk, at: &cursor, plan: plan,
                                denseFd: denseFd, layerFds: layerFds, stride: stride)
                 progress[plan.name] = cursor
@@ -525,7 +531,7 @@ public final class StreamingInstaller {
         var hasher: SHA256? = (expectedHash != nil && resumeFrom == 0) ? SHA256() : nil
         _ = start
         log("\(name): downloading from byte \(cursor) of \(expectedSize)")
-        try streamShard(name, from: cursor) { chunk in
+        try streamShard(name, from: cursor, expectedSize: expectedSize) { chunk in
             let wrote = chunk.withUnsafeBytes { pwrite(fd, $0.baseAddress!, chunk.count, off_t(cursor)) }
             guard wrote == chunk.count else { throw Error.ioError(name) }
             hasher?.update(data: chunk)
@@ -629,7 +635,8 @@ public final class StreamingInstaller {
 
     /// Streams shard bytes from `offset`, delivering chunks in order. Retries
     /// transient failures, resuming from the caller-advanced cursor.
-    private func streamShard(_ shard: String, from offset: Int, handler: @escaping (Data) throws -> Void) throws {
+    private func streamShard(_ shard: String, from offset: Int, expectedSize: Int,
+                             handler: @escaping (Data) throws -> Void) throws {
         let guarded: (Data) throws -> Void = { [weak self] chunk in
             if self?.shouldCancel?() == true { throw Error.cancelled }
             try handler(chunk)
@@ -651,7 +658,7 @@ public final class StreamingInstaller {
             while attempt < 8 {
                 let pump = HTTPChunkPump(
                     url: URL(string: "\(source.httpBase!)/\(shard)")!,
-                    fromByte: start
+                    fromByte: start, expectedSize: expectedSize
                 )
                 do {
                     var delivered = 0
@@ -662,6 +669,8 @@ public final class StreamingInstaller {
                     return   // completed
                 } catch {
                     if case Error.cancelled = error { throw error }   // user asked; don't retry
+                    if case Error.badContentRange = error { throw error }
+                    if case Error.rangeNotHonored = error { throw error }
                     lastError = error
                     start += pump.bytesDelivered
                     attempt += 1
@@ -679,15 +688,17 @@ public final class StreamingInstaller {
 final class HTTPChunkPump: NSObject, URLSessionDataDelegate {
     private let url: URL
     private let fromByte: Int
+    private let expectedSize: Int
     private var queue: [Data] = []
     private var finished = false
     private var failure: Error?
     private let lock = NSCondition()
     private(set) var bytesDelivered = 0
 
-    init(url: URL, fromByte: Int) {
+    init(url: URL, fromByte: Int, expectedSize: Int) {
         self.url = url
         self.fromByte = fromByte
+        self.expectedSize = expectedSize
     }
 
     func run(_ handler: (Data) throws -> Void) throws {
@@ -737,23 +748,45 @@ final class HTTPChunkPump: NSObject, URLSessionDataDelegate {
     // a rate-limit or CDN error page (429/503 HTML) gets written straight
     // into the container as if it were weights — silent corruption that only
     // shows up as degraded model output. On resume (fromByte > 0) the server
-    // must honor the Range with a 206: a 200 would restart the file from
-    // byte zero while we append at an offset.
+    // must honor the Range with a 206 and a matching Content-Range: a 200
+    // or a 206 from the wrong offset would append the wrong bytes.
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
                     didReceive response: URLResponse,
                     completionHandler: @escaping (URLSession.ResponseDisposition) -> Void) {
-        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let http = response as? HTTPURLResponse
+        let code = http?.statusCode ?? 0
         let ok = fromByte > 0 ? code == 206 : (code == 200 || code == 206)
-        if ok {
+        var refusal: Swift.Error?
+        if fromByte > 0 && code == 200 {
+            refusal = StreamingInstaller.Error.rangeNotHonored(range: "bytes=\(fromByte)-", status: code)
+        } else if !ok {
+            refusal = StreamingInstaller.Error.httpError(url.lastPathComponent, code)
+        } else if fromByte > 0 && !acceptsContentRange(http?.value(forHTTPHeaderField: "Content-Range")) {
+            refusal = StreamingInstaller.Error.badContentRange(
+                expected: "bytes \(fromByte)-*/\(expectedSize)",
+                got: http?.value(forHTTPHeaderField: "Content-Range") ?? "absent")
+        }
+        guard let refusal else {
             completionHandler(.allow)
             return
         }
         lock.lock()
-        failure = StreamingInstaller.Error.httpError(url.lastPathComponent, code)
+        failure = refusal
         finished = true
         lock.signal()
         lock.unlock()
         completionHandler(.cancel)
+    }
+
+    private func acceptsContentRange(_ value: String?) -> Bool {
+        guard let value,
+              value.range(of: #"\Abytes [0-9]+-[0-9]+/[0-9]+\z"#,
+                          options: [.regularExpression, .caseInsensitive]) != nil else { return false }
+        let fields = value.split { $0 == " " || $0 == "-" || $0 == "/" }
+        guard fields.count == 4,
+              let start = Int(fields[1]), let end = Int(fields[2]), let total = Int(fields[3])
+        else { return false }
+        return start == fromByte && start <= end && end < total && total == expectedSize
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
@@ -765,7 +798,9 @@ final class HTTPChunkPump: NSObject, URLSessionDataDelegate {
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         lock.lock()
-        if let error { failure = error }
+        // Cancelling a refused response also reports NSURLErrorCancelled;
+        // preserve the named protocol error that caused the cancellation.
+        if failure == nil, let error { failure = error }
         finished = true
         lock.signal()
         lock.unlock()
