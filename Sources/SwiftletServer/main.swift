@@ -34,7 +34,7 @@ struct ChatContent: Decodable {
     let text: String
     init(from decoder: Decoder) throws {
         let c = try decoder.singleValueContainer()
-        if try c.decodeNil() {
+        if c.decodeNil() {
             text = ""
         } else if let s = try? c.decode(String.self) {
             text = s
