@@ -15,6 +15,8 @@ import Testing
     /// tie-break, lowest slot on full ties, batch members protected.
     struct ReferencePolicy {
         let maxSlots: Int
+        /// LRU instead of LFU: every slot ranks at frequency 0.
+        var lru = false
         var slotKey: [Int64] = []
         var keyToSlot: [Int64: Int] = [:]
         var freq: [Int64: Int] = [:]
@@ -60,7 +62,7 @@ import Testing
             var victim = -1
             var victimScore = (Int.max, Int.max)
             for s in 0..<slotKey.count where !excluding.contains(s) {
-                let f = freq[slotKey[s]] ?? 0
+                let f = lru ? 0 : freq[slotKey[s]] ?? 0
                 let score = (f, lastUse[s] ?? 0)
                 if score < victimScore {
                     victimScore = score
@@ -95,7 +97,8 @@ import Testing
     /// batches of 1-6 distinct experts) over 16 slots of the 64-blob tiny
     /// container: every hit/miss count and every slot placement must match
     /// the reference policy, request by request.
-    @Test func placementMatchesTheReferencePolicy() throws {
+    @Test(arguments: [ExpertCache.EvictionPolicy.lfu, .lru])
+    func placementMatchesTheReferencePolicy(policy: ExpertCache.EvictionPolicy) throws {
         let out = try Self.repackedTiny()
         defer { try? FileManager.default.removeItem(at: out) }
         let device = try #require(MTLCreateSystemDefaultDevice())
@@ -103,7 +106,8 @@ import Testing
             containerDir: out, device: device,
             budgetBytes: Self.budget(slots: 16, container: out))
         #expect(cache.slotCount == 16, "a 16-slot budget must yield 16 slots")
-        var reference = ReferencePolicy(maxSlots: cache.slotCount)
+        cache.policy = policy
+        var reference = ReferencePolicy(maxSlots: cache.slotCount, lru: policy == .lru)
         let layers = cache.reader.layout.layerCount
         let expertsPerLayer = cache.reader.layout.expertCount
 

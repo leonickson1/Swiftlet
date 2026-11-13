@@ -225,12 +225,9 @@ func runVerify(modelDir: String, fixturesPath: String) throws {
     print(String(format: "  (%.1fs)", -start.timeIntervalSinceNow))
 }
 
-/// End-to-end text generation on the CPU reference runtime.
-func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawIds: [Int]?) async throws {
-    let url = URL(fileURLWithPath: modelDir)
-    FileHandle.standardError.write(Data("loading tokenizer + model...\n".utf8))
-    let tokenizer: Tokenizer? = rawIds == nil ? try await AutoTokenizer.from(modelFolder: url) : nil
-    let model: any InferenceModel
+/// The model `generate` runs: Metal with --gpu (experts stream through the
+/// bounded cache on a .qpack container), the CPU reference otherwise.
+func loadInferenceModel(_ url: URL) throws -> any InferenceModel {
     if CommandLine.arguments.contains("--gpu") {
         // Metal runtime: weights stay quantized; experts stream via the
         // bounded cache (--cache-gb) when the model is a .qpack container.
@@ -243,6 +240,30 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
            let chunk = Int(chunkFlag) {
             metal.prefillMode = chunk <= 0 ? .tokenMajor : .layerMajor(chunkTokens: chunk)
         }
+        // --no-page-cache: expert misses read past the kernel's file cache, so
+        // every miss is a device read (experiment control, CACHE_SUITE.md).
+        if CommandLine.arguments.contains("--no-page-cache") {
+            guard let cache = metal.expertCache else {
+                FileHandle.standardError.write(Data("--no-page-cache needs a .qpack container\n".utf8))
+                exit(2)
+            }
+            cache.bypassPageCache = true
+            FileHandle.standardError.write(Data("expert reads bypass the page cache (F_NOCACHE)\n".utf8))
+        }
+        // --cache-policy lfu|lru: the expert cache's eviction rule
+        // (docs/CACHE_SUITE.md); lru is the default.
+        if let name = flagValue(CommandLine.arguments, "--cache-policy") {
+            guard let policy = ExpertCache.EvictionPolicy(rawValue: name), let cache = metal.expertCache else {
+                FileHandle.standardError.write(Data("--cache-policy takes lfu or lru, on a .qpack container\n".utf8))
+                exit(2)
+            }
+            cache.policy = policy
+        }
+        // Always stated, so a log says which policy produced it (the default
+        // changed from lfu to lru; scripts/cache_suite_report.py reads this).
+        if let cache = metal.expertCache {
+            FileHandle.standardError.write(Data("expert cache policy: \(cache.policy.rawValue)\n".utf8))
+        }
         // S3b follow-up: what the device's counters can actually sample, and
         // whether the per-phase GPU split is measured or honestly absent.
         let split: String
@@ -254,14 +275,34 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
         }
         FileHandle.standardError.write(Data(
             "S3b counters: \(metal.counterSamplingSupport.summary)\n\(split)\n".utf8))
-        model = metal
+        return metal
     } else {
         let cpu = try QwenCPUModel(modelDir: url)
         // --lazy: ~3 GB peak instead of ~10-14 GB, at the cost of re-dequantizing
         // dense weights per step. Kind to machines that are doing other work.
         cpu.retainAllLayers = !CommandLine.arguments.contains("--lazy")
-        model = cpu
+        return cpu
     }
+}
+
+/// EOS ids from generation_config.json / config.json (int or array).
+func eosTokenIDs(_ url: URL) -> Set<Int> {
+    var eos = Set<Int>()
+    for name in ["generation_config.json", "config.json"] {
+        guard let data = FileManager.default.contents(atPath: url.appendingPathComponent(name).path),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+        if let v = obj["eos_token_id"] as? Int { eos.insert(v) }
+        if let vs = obj["eos_token_id"] as? [Int] { eos.formUnion(vs) }
+    }
+    return eos
+}
+
+/// End-to-end text generation on the CPU reference runtime.
+func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawIds: [Int]?) async throws {
+    let url = URL(fileURLWithPath: modelDir)
+    FileHandle.standardError.write(Data("loading tokenizer + model...\n".utf8))
+    let tokenizer: Tokenizer? = rawIds == nil ? try await AutoTokenizer.from(modelFolder: url) : nil
+    let model = try loadInferenceModel(url)
 
     var ids: [Int]
     if let rawIds {
@@ -272,14 +313,7 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
         ids = tokenizer!.encode(text: prompt)
     }
 
-    // EOS ids from generation_config.json / config.json (int or array).
-    var eos = Set<Int>()
-    for name in ["generation_config.json", "config.json"] {
-        guard let data = FileManager.default.contents(atPath: url.appendingPathComponent(name).path),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
-        if let v = obj["eos_token_id"] as? Int { eos.insert(v) }
-        if let vs = obj["eos_token_id"] as? [Int] { eos.formUnion(vs) }
-    }
+    let eos = eosTokenIDs(url)
 
     // Same admission as TextGenerator/SwiftletSession: the model rejects an
     // oversized prompt itself, but the output request must be clamped here or
@@ -287,10 +321,28 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
     let admittedMaxNew = try ContextWindow(maximumTokens: model.contextCapacity)
         .admittedMaxNew(processedTokens: 0, incomingTokens: ids.count, requestedMaxNew: maxNew)
 
+    // --trace-steps <file>: one JSON line per step with timing, expert fetch
+    // tiers and routing (docs/CACHE_AB.md). Needs --gpu on a .qpack container.
+    var tracer: StepTracer?
+    if let tracePath = flagValue(CommandLine.arguments, "--trace-steps") {
+        if let metal = model as? QwenMetalModel {
+            tracer = try StepTracer(
+                path: tracePath, model: metal, modelDir: modelDir,
+                promptTokens: ids.count, maxNew: admittedMaxNew)
+        }
+        if tracer == nil {
+            FileHandle.standardError.write(Data(
+                "--trace-steps needs --gpu and a .qpack container; not tracing\n".utf8))
+        }
+    }
+
     let state = QwenCPUModel.DecodeState()
     let prefillStart = Date()
     var logits = try model.step(ids, state: state)
     let prefillSecs = -prefillStart.timeIntervalSinceNow
+    if let metal = model as? QwenMetalModel {
+        tracer?.record(kind: "prefill", step: 0, token: nil, tokens: ids.count, metrics: metal.lastStepMetrics)
+    }
     if let metal = model as? QwenMetalModel {
         let m = metal.lastStepMetrics
         let gpu = gpuTimingSummary(
@@ -349,9 +401,11 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
         logits = try model.step([best], state: state)
         if let metal = model as? QwenMetalModel {
             decodeMetal.add(metal.lastStepMetrics)
+            tracer?.record(kind: "decode", step: generated.count, token: best, tokens: 1, metrics: metal.lastStepMetrics)
         }
     }
     let decodeSecs = -decodeStart.timeIntervalSinceNow
+    tracer?.finish(generated: generated.count, decodeSeconds: decodeSecs)
     if let tokenizer,
        let rest = StreamingText.finalDelta(printed: printed, decoded: tokenizer.decode(tokens: generated)) {
         print(rest, terminator: "")
@@ -460,6 +514,18 @@ case "dump-tensor" where args.count >= 5:
         print("dump failed: \(error)")
         exit(1)
     }
+case "generate" where args.count >= 3 && flagValue(args, "--prompts-file") != nil:
+    do {
+        try await runSuite(
+            modelDir: args[2],
+            promptsFile: flagValue(args, "--prompts-file")!,
+            defaultMaxNew: Int(flagValue(args, "--max-new") ?? "256") ?? 256,
+            answersPath: flagValue(args, "--answers"),
+            tracePath: flagValue(args, "--trace-steps"))
+    } catch {
+        print("generate failed: \(error)")
+        exit(1)
+    }
 case "generate" where args.count >= 3:
     do {
         try await runGenerate(
@@ -501,10 +567,15 @@ default:
     print("  swiftlet info <model>            model budget summary (\(ArchConfig.known.keys.sorted().joined(separator: " | ")))")
     print("  swiftlet verify <model-dir> <fixtures.safetensors>   compare CPU forward vs mlx fixture")
     print("  swiftlet dump-tensor <model-dir> <module-path> <out.safetensors>   dequantized f32 weights of one module")
-    print("  swiftlet generate <model-dir> --prompt \"...\" [--max-new 32] [--chat] [--gpu] [--cache-gb 8] [--prefill-chunk 32] [--lazy]")
+    print("  swiftlet generate <model-dir> --prompt \"...\" [--max-new 32] [--chat] [--gpu] [--cache-gb 8] [--prefill-chunk 32] [--lazy] [--trace-steps out.jsonl]")
+    print("  swiftlet generate <model-dir> --gpu --prompts-file suite.jsonl [--answers out.jsonl] [--trace-steps out.jsonl] [--max-new 256] [--cache-gb 8]")
     print("  swiftlet chat <model-dir> [\"turn\" ...] [--max-new 256] [--cache-gb 8] [--greedy] [--system \"...\"]")
     print("")
     print("  --gpu       Metal runtime; on a .qpack container experts stream through a bounded cache")
     print("  --cache-gb  expert cache budget, default 8 (note: swiftlet-server defaults to 2)")
     print("  --lazy      CPU path only: ~3 GB peak instead of ~10-14 GB, slower per step")
+    print("  --cache-policy  with --gpu on a .qpack: expert cache eviction, lru (default) or lfu")
+    print("  --no-page-cache  with --gpu on a .qpack: expert misses bypass the OS file cache, so each is a device read (experiment control)")
+    print("  --prompts-file  run every prompt in a JSONL suite back to back in one process (one model, one expert cache); see docs/CACHE_SUITE.md")
+    print("  --trace-steps  with --gpu on a .qpack: one JSON line per step (timing, expert fetch tiers, routing); see docs/CACHE_AB.md")
 }
