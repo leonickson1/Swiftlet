@@ -323,7 +323,7 @@ public final class QwenCPUModel {
             }
         }
         var k = Self.linear(x, rows: S, inDim: cfg.hiddenSize, weight: w.kProj, outDim: KVH * hd)
-        var v = Self.linear(x, rows: S, inDim: cfg.hiddenSize, weight: w.vProj, outDim: KVH * hd)
+        let v = Self.linear(x, rows: S, inDim: cfg.hiddenSize, weight: w.vProj, outDim: KVH * hd)
 
         Self.rmsNorm(&q, rows: S * H, dim: hd, weight: w.qNorm, eps: eps)
         Self.rmsNorm(&k, rows: S * KVH, dim: hd, weight: w.kNorm, eps: eps)
