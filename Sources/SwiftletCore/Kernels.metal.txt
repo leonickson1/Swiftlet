@@ -260,6 +260,118 @@ kernel void gemv_affine_fast(
     if (lane == 0) y[p.yOff + row] = acc;
 }
 
+// ===== Multi-GEMV: up to 24 quantized projections that share an input
+// width, group size, bit width and scale dtype, in one dispatch. Slice z has
+// its own buffer (weights, scales and biases together, bound at buffer(4 + z)),
+// its own offsets into it, its own row count and its own x and y offsets.
+// The grid lays the slices' rows end to end (slice z owns rows
+// [rowStart, rowStart + outDim)), so no threadgroup idles. The per-row
+// arithmetic is gemv_affine_fast's (4-bit) or gemv_affine_fast8's (8-bit)
+// verbatim, so every slice's rows are bitwise what its own dispatch writes.
+struct GemvSlice {
+    ulong wOff;
+    ulong sOff;
+    ulong bOff;
+    uint outDim;
+    uint rowStart;
+    uint xOff;
+    uint yOff;
+};
+
+kernel void gemv_affine_fast_multi(
+    device const float *x      [[buffer(0)]],
+    device float       *y      [[buffer(1)]],
+    constant GemvSlice *sl     [[buffer(2)]],
+    constant uint4     &shape  [[buffer(3)]],   // (inDim, groupSize, bits | scalesType << 8, slices)
+    device const uchar *s0  [[buffer(4)]],  device const uchar *s1  [[buffer(5)]],
+    device const uchar *s2  [[buffer(6)]],  device const uchar *s3  [[buffer(7)]],
+    device const uchar *s4  [[buffer(8)]],  device const uchar *s5  [[buffer(9)]],
+    device const uchar *s6  [[buffer(10)]],  device const uchar *s7  [[buffer(11)]],
+    device const uchar *s8  [[buffer(12)]],  device const uchar *s9  [[buffer(13)]],
+    device const uchar *s10 [[buffer(14)]],  device const uchar *s11 [[buffer(15)]],
+    device const uchar *s12 [[buffer(16)]],  device const uchar *s13 [[buffer(17)]],
+    device const uchar *s14 [[buffer(18)]],  device const uchar *s15 [[buffer(19)]],
+    device const uchar *s16 [[buffer(20)]],  device const uchar *s17 [[buffer(21)]],
+    device const uchar *s18 [[buffer(22)]],  device const uchar *s19 [[buffer(23)]],
+    device const uchar *s20 [[buffer(24)]],  device const uchar *s21 [[buffer(25)]],
+    device const uchar *s22 [[buffer(26)]],  device const uchar *s23 [[buffer(27)]],
+    uint2 tpg [[thread_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]])
+{
+    uint z = 0;
+    while (z + 1 < shape.w && tpg.y >= sl[z + 1].rowStart) ++z;
+    const uint row = tpg.y - sl[z].rowStart;
+    if (row >= sl[z].outDim) return;
+    device const uchar *w;
+    switch (z) {
+        case 0: w = s0; break;  case 1: w = s1; break;  case 2: w = s2; break;  case 3: w = s3; break;
+        case 4: w = s4; break;  case 5: w = s5; break;  case 6: w = s6; break;  case 7: w = s7; break;
+        case 8: w = s8; break;  case 9: w = s9; break;  case 10: w = s10; break;  case 11: w = s11; break;
+        case 12: w = s12; break;  case 13: w = s13; break;  case 14: w = s14; break;  case 15: w = s15; break;
+        case 16: w = s16; break;  case 17: w = s17; break;  case 18: w = s18; break;  case 19: w = s19; break;
+        case 20: w = s20; break;  case 21: w = s21; break;  case 22: w = s22; break;  case 23: w = s23; break;
+        default: return;
+    }
+    const uint inDim = shape.x;
+    const uint groupSize = shape.y;
+    const uint bits = shape.z & 0xFFu;
+    const uint scalesType = shape.z >> 8;
+    const uint groups = inDim / groupSize;
+
+    float acc = 0;
+    if (bits == 4) {
+        const uint packedCols = inDim / 8;           // uint32 words per row
+        const uint wordsPerGroup = groupSize / 8;
+        device const uint *wr = (device const uint *)(w + sl[z].wOff + ulong(row) * packedCols * 4);
+        for (uint g = lane; g < groups; g += 32) {
+            float qdot = 0;
+            float xsum = 0;
+            uint base = g * wordsPerGroup;
+            uint xbase = sl[z].xOff + g * groupSize;
+            for (uint wi = 0; wi < wordsPerGroup; ++wi) {
+                uint word = wr[base + wi];
+                uint xo = xbase + wi * 8;
+                qdot += float(word & 0xF) * x[xo]
+                      + float((word >> 4) & 0xF) * x[xo + 1]
+                      + float((word >> 8) & 0xF) * x[xo + 2]
+                      + float((word >> 12) & 0xF) * x[xo + 3]
+                      + float((word >> 16) & 0xF) * x[xo + 4]
+                      + float((word >> 20) & 0xF) * x[xo + 5]
+                      + float((word >> 24) & 0xF) * x[xo + 6]
+                      + float((word >> 28) & 0xF) * x[xo + 7];
+                xsum += x[xo] + x[xo+1] + x[xo+2] + x[xo+3] + x[xo+4] + x[xo+5] + x[xo+6] + x[xo+7];
+            }
+            uint gi = row * groups + g;
+            acc += load_scale(w, sl[z].sOff, gi, scalesType) * qdot
+                 + load_scale(w, sl[z].bOff, gi, scalesType) * xsum;
+        }
+    } else {
+        const uint packedCols = inDim / 4;           // uint32 words per row
+        const uint wordsPerGroup = groupSize / 4;
+        device const uint *wr = (device const uint *)(w + sl[z].wOff + ulong(row) * packedCols * 4);
+        for (uint g = lane; g < groups; g += 32) {
+            float qdot = 0;
+            float xsum = 0;
+            uint base = g * wordsPerGroup;
+            uint xbase = sl[z].xOff + g * groupSize;
+            for (uint wi = 0; wi < wordsPerGroup; ++wi) {
+                uint word = wr[base + wi];
+                uint xo = xbase + wi * 4;
+                qdot += float(word & 0xFF) * x[xo]
+                      + float((word >> 8) & 0xFF) * x[xo + 1]
+                      + float((word >> 16) & 0xFF) * x[xo + 2]
+                      + float((word >> 24) & 0xFF) * x[xo + 3];
+                xsum += x[xo] + x[xo+1] + x[xo+2] + x[xo+3];
+            }
+            uint gi = row * groups + g;
+            acc += load_scale(w, sl[z].sOff, gi, scalesType) * qdot
+                 + load_scale(w, sl[z].bOff, gi, scalesType) * xsum;
+        }
+    }
+    acc = simd_sum(acc);
+    if (lane == 0) y[sl[z].yOff + row] = acc;
+}
+
 // 8-bit variant of the fast path: 4 weights per uint32 word. Same alignment
 // requirement; group size divisible by 4.
 kernel void gemv_affine_fast8(

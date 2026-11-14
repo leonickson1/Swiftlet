@@ -30,16 +30,30 @@ import Testing
     static let commandBuffersPerToken = 9
     /// S2 dispatch deltas: +3 per attention layer per token (q prep, KV
     /// append, causal attention). Was 212/214 (q4) and 218/220 (q35) when
-    /// the attention core ran on CPU.
+    /// the attention core ran on CPU. One SwiGLU dispatch per layer instead
+    /// of one per routed expert: -(top_k - 1) per layer per token, so -8 on
+    /// these 8-layer, top-2 models (was 218/220 and 224/226).
     static let q4Baseline = FastPathBaseline(
         commandBuffersPerToken: commandBuffersPerToken,
-        intermediateDispatches: 218,
-        finalDispatches: 220
+        intermediateDispatches: 210,
+        finalDispatches: 212
     )
     static let q35Baseline = FastPathBaseline(
         commandBuffersPerToken: commandBuffersPerToken,
-        intermediateDispatches: 224,
-        finalDispatches: 226
+        intermediateDispatches: 216,
+        finalDispatches: 218
+    )
+    /// The same model from a .qpack container, where independent quantized
+    /// GEMVs share gemv_affine_fast_multi dispatches: per layer, every
+    /// expert's gate and up plus the shared expert's gate, up and gate scalar
+    /// become one dispatch, and every down projection one more; q/k/v and
+    /// DeltaNet's input projections become one each. -74 per token here (see
+    /// BatchedGemvTests). Raw checkpoints sit at unaligned offsets and keep
+    /// one dispatch per GEMV.
+    static let q4QpackBaseline = FastPathBaseline(
+        commandBuffersPerToken: commandBuffersPerToken,
+        intermediateDispatches: 136,
+        finalDispatches: 138
     )
 
     static let fixturesDir = URL(fileURLWithPath: #filePath)
@@ -346,7 +360,7 @@ import Testing
         let singleMetrics = sequentialGPU.lastStepMetrics
         Self.expectInstrumentation(singleMetrics, tokens: 1, label: "qpack one token")
         Self.expectFastPathBaseline(
-            singleMetrics, tokens: 1, baseline: Self.q4Baseline, label: "qpack one token"
+            singleMetrics, tokens: 1, baseline: Self.q4QpackBaseline, label: "qpack one token"
         )
         Self.expectPhaseTimeline(
             singleMetrics,
@@ -367,7 +381,7 @@ import Testing
         Self.expectInstrumentation(multiMetrics, tokens: tokens.count, label: "qpack multi token")
         Self.expectFastPathBaseline(
             multiMetrics, tokens: tokens.count,
-            baseline: Self.q4Baseline, label: "qpack multi token"
+            baseline: Self.q4QpackBaseline, label: "qpack multi token"
         )
         Self.expectPhaseTimeline(
             multiMetrics,
@@ -387,7 +401,7 @@ import Testing
         )
         Self.expectFastPathBaseline(
             elidingGPU.lastStepMetrics, tokens: 1,
-            baseline: Self.q4Baseline, label: "qpack continuation"
+            baseline: Self.q4QpackBaseline, label: "qpack continuation"
         )
         Self.expectPhaseTimeline(
             elidingGPU.lastStepMetrics,
