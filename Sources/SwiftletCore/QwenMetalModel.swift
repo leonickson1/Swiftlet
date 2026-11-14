@@ -288,6 +288,10 @@ public final class QwenMetalModel {
     /// what the PrefillExpertUnionPlan oracle predicts. Stays internal.
     var prefillExpertUnionObserver: ((_ layer: Int, _ experts: [Int]) -> Void)?
 
+    /// Test hook: false gives every GEMV its own dispatch, as before
+    /// gemv_affine_fast_multi. Stays internal.
+    var batchGemvs = true
+
     /// Prompt-prefill schedule for multi-token step calls. Single-token
     /// decode steps never consult this.
     public enum PrefillMode: Equatable, Sendable {
@@ -1485,67 +1489,66 @@ extension QwenMetalModel {
         let shInter = cfg.sharedExpertIntermediateSize
         let moe = layers[pend.stacksLayer].moe
         let fl = fastLayers[pend.stacksLayer]
-        let projs = expertProjs
-
-        for (ki, pick) in pend.picks.enumerated() {
-            let gLin: GPULinear
-            let uLin: GPULinear
-            var wE = 0, sE = 0
-            if let projs, ki < pend.bufs.count {
-                let buf = pend.bufs[ki]
-                gLin = projs.gate.linear(on: buf)
-                uLin = projs.up.linear(on: buf)
-            } else {
-                let st = moe.stacks!
-                gLin = st.gate.lin; uLin = st.up.lin
-                wE = pick.0; sE = pick.0
-            }
-            try engine.encodeGemv(enc, gLin, rows: inter,
-                wExtra: wE * (moe.stacks?.gate.wStride ?? 0), sExtra: sE * (moe.stacks?.gate.sStride ?? 0),
-                bExtra: sE * (moe.stacks?.gate.sStride ?? 0),
-                x: slot.scratch, xOff: slot.base + reg.xmoe,
-                y: slot.scratch, yOff: slot.base + reg.exp + ki * inter)
-            try engine.encodeGemv(enc, uLin, rows: inter,
-                wExtra: wE * (moe.stacks?.up.wStride ?? 0), sExtra: sE * (moe.stacks?.up.sStride ?? 0),
-                bExtra: sE * (moe.stacks?.up.sStride ?? 0),
-                x: slot.scratch, xOff: slot.base + reg.xmoe,
-                y: slot.scratch, yOff: slot.base + reg.exp + pend.picks.count * inter + ki * inter)
-        }
-        try engine.encodeGemv(enc, moe.sharedGate, x: slot.scratch, xOff: slot.base + reg.xmoe,
-            y: slot.scratch, yOff: slot.base + reg.sh)
-        try engine.encodeGemv(enc, moe.sharedUp, x: slot.scratch, xOff: slot.base + reg.xmoe,
-            y: slot.scratch, yOff: slot.base + reg.sh + shInter)
-        try engine.encodeGemv(enc, fl.sharedGateLin, x: slot.scratch, xOff: slot.base + reg.xmoe,
-            y: slot.scratch, yOff: slot.base + reg.shg)
-        barrier(enc)
         let K = pend.picks.count
-        for ki in 0..<K {
-            try engine.encodeSiluMul(enc, buf: slot.scratch, count: inter,
-                gOff: slot.base + reg.exp + ki * inter,
-                uOff: slot.base + reg.exp + K * inter + ki * inter,
-                dstOff: slot.base + reg.exp + 2 * K * inter + ki * inter)
-        }
-        try engine.encodeSiluMul(enc, buf: slot.scratch, count: shInter,
-            gOff: slot.base + reg.sh, uOff: slot.base + reg.sh + shInter,
-            dstOff: slot.base + reg.sh + 2 * shInter)
-        barrier(enc)
-        for (ki, pick) in pend.picks.enumerated() {
-            let dLin: GPULinear
-            var wE = 0, sE = 0
+        let base = slot.base
+
+        /// Routed expert ki's gate, up or down linear: its .qpack cache slot,
+        /// or its slice of the stacked tensor with the per-expert advance
+        /// folded into the offsets.
+        func expertLinear(_ ki: Int, _ pick: Int,
+                          _ proj: KeyPath<(gate: ExpertProj, up: ExpertProj, down: ExpertProj), ExpertProj>,
+                          _ stack: KeyPath<(gate: ExpertStack, up: ExpertStack, down: ExpertStack), ExpertStack>
+        ) -> GPULinear {
             if let projs = expertProjs, ki < pend.bufs.count {
-                dLin = projs.down.linear(on: pend.bufs[ki])
-            } else {
-                dLin = moe.stacks!.down.lin
-                wE = pick.0; sE = pick.0
+                return projs[keyPath: proj].linear(on: pend.bufs[ki])
             }
-            try engine.encodeGemv(enc, dLin, rows: D,
-                wExtra: wE * (moe.stacks?.down.wStride ?? 0), sExtra: sE * (moe.stacks?.down.sStride ?? 0),
-                bExtra: sE * (moe.stacks?.down.sStride ?? 0),
-                x: slot.scratch, xOff: slot.base + reg.exp + 2 * K * inter + ki * inter,
-                y: slot.scratch, yOff: slot.base + reg.dexp + ki * D)
+            let st = moe.stacks![keyPath: stack]
+            var lin = st.lin
+            lin.wOff += pick * st.wStride
+            lin.sOff += pick * st.sStride
+            lin.bOff += pick * st.sStride
+            return lin
         }
-        try engine.encodeGemv(enc, moe.sharedDown, x: slot.scratch, xOff: slot.base + reg.sh + 2 * shInter,
-            y: slot.scratch, yOff: slot.base + reg.sh + 3 * shInter)
+
+        // Every routed expert's gate and up, the shared expert's gate and up,
+        // and the shared-expert gate scalar all read xmoe and write disjoint
+        // rows: one batch.
+        var first: [MetalEngine.GemvJob] = []
+        for (ki, pick) in pend.picks.enumerated() {
+            first.append(.init(lin: expertLinear(ki, pick.0, \.gate, \.gate), rows: inter,
+                               xOff: base + reg.xmoe, yOff: base + reg.exp + ki * inter))
+            first.append(.init(lin: expertLinear(ki, pick.0, \.up, \.up), rows: inter,
+                               xOff: base + reg.xmoe, yOff: base + reg.exp + K * inter + ki * inter))
+        }
+        first.append(.init(lin: moe.sharedGate, rows: moe.sharedGate.outDim,
+                           xOff: base + reg.xmoe, yOff: base + reg.sh))
+        first.append(.init(lin: moe.sharedUp, rows: moe.sharedUp.outDim,
+                           xOff: base + reg.xmoe, yOff: base + reg.sh + shInter))
+        first.append(.init(lin: fl.sharedGateLin, rows: fl.sharedGateLin.outDim,
+                           xOff: base + reg.xmoe, yOff: base + reg.shg))
+        try engine.encodeGemvs(enc, first, x: slot.scratch, y: slot.scratch, batch: batchGemvs)
+        barrier(enc)
+        // The K gate rows, the K up rows and the K outputs each sit back to
+        // back, so one elementwise dispatch over K * inter does every
+        // expert's SwiGLU with the same per-element arithmetic.
+        try engine.encodeSiluMul(enc, buf: slot.scratch, count: K * inter,
+            gOff: base + reg.exp,
+            uOff: base + reg.exp + K * inter,
+            dstOff: base + reg.exp + 2 * K * inter)
+        try engine.encodeSiluMul(enc, buf: slot.scratch, count: shInter,
+            gOff: base + reg.sh, uOff: base + reg.sh + shInter,
+            dstOff: base + reg.sh + 2 * shInter)
+        barrier(enc)
+        // Every down projection, routed and shared: one batch.
+        var second: [MetalEngine.GemvJob] = []
+        for (ki, pick) in pend.picks.enumerated() {
+            second.append(.init(lin: expertLinear(ki, pick.0, \.down, \.down), rows: D,
+                                xOff: base + reg.exp + 2 * K * inter + ki * inter,
+                                yOff: base + reg.dexp + ki * D))
+        }
+        second.append(.init(lin: moe.sharedDown, rows: moe.sharedDown.outDim,
+                            xOff: base + reg.sh + 2 * shInter, yOff: base + reg.sh + 3 * shInter))
+        try engine.encodeGemvs(enc, second, x: slot.scratch, y: slot.scratch, batch: batchGemvs)
         barrier(enc)
 
         try encWeightedAccum(enc, weights: pend.weights, count: pend.picks.count, slot: slot)
@@ -1596,12 +1599,12 @@ extension QwenMetalModel {
     ) throws {
         try encNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0, slot: slot)
         barrier(enc)
-        try engine.encodeGemv(enc, attn.qProj, x: slot.scratch, xOff: slot.base + reg.x0,
-            y: slot.scratch, yOff: slot.base + reg.qout)
-        try engine.encodeGemv(enc, attn.kProj, x: slot.scratch, xOff: slot.base + reg.x0,
-            y: slot.scratch, yOff: slot.base + reg.knew)
-        try engine.encodeGemv(enc, attn.vProj, x: slot.scratch, xOff: slot.base + reg.x0,
-            y: slot.scratch, yOff: slot.base + reg.vnew)
+        let x0 = slot.base + reg.x0
+        try engine.encodeGemvs(enc, [
+            .init(lin: attn.qProj, rows: attn.qProj.outDim, xOff: x0, yOff: slot.base + reg.qout),
+            .init(lin: attn.kProj, rows: attn.kProj.outDim, xOff: x0, yOff: slot.base + reg.knew),
+            .init(lin: attn.vProj, rows: attn.vProj.outDim, xOff: x0, yOff: slot.base + reg.vnew),
+        ], x: slot.scratch, y: slot.scratch, batch: batchGemvs)
     }
 
     /// Attention: output projection and residual add into the slot's hidden row.
@@ -1752,10 +1755,9 @@ extension QwenMetalModel {
     ) throws {
         try encNormCopy(enc, w: fl.inputNorm, dstOff: reg.x0, slot: slot)
         barrier(enc)
-        for proj in deltaInProjections(delta) {
-            try engine.encodeGemv(enc, proj.lin, x: slot.scratch, xOff: slot.base + reg.x0,
-                y: slot.scratch, yOff: slot.base + proj.dst)
-        }
+        try engine.encodeGemvs(enc, deltaInProjections(delta).map {
+            .init(lin: $0.lin, rows: $0.lin.outDim, xOff: slot.base + reg.x0, yOff: slot.base + $0.dst)
+        }, x: slot.scratch, y: slot.scratch, batch: batchGemvs)
         barrier(enc)
         if config.deltaLayout == .fusedInterleaved {
             try encDeltaDeinterleave(enc, slot: slot)

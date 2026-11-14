@@ -131,26 +131,34 @@ import Testing
     // MARK: - S1b token-batched GEMV
 
     static func quantizedLinear(
-        _ engine: MetalEngine, bits: Int, pad: Int, outDim O: Int = 48, inDim I: Int = 128
+        _ engine: MetalEngine, bits: Int, pad: Int, outDim O: Int = 48, inDim I: Int = 128,
+        group: Int = 32, scalesType: UInt32 = 0, seed: UInt64 = 0
     ) -> MetalShardStore.GPULinear {
-        let group = 32
         let perWord = 32 / bits
-        var rng = Rand(UInt64(bits * 100 + pad + 7))
+        var rng = Rand(UInt64(bits * 100 + pad + 7) + seed * 7919)
         let packed = (0..<O * I / perWord).map { _ in rng.next32() }
         let scales = (0..<O * I / group).map { _ in rng.float() * 0.1 }
         let biases = (0..<O * I / group).map { _ in rng.float() * 0.05 }
+        // Scales and biases as f32 (scalesType 0), f16 (1) or bf16 (2).
+        func append(_ v: [Float], to blob: inout Data) {
+            switch scalesType {
+            case 0: v.withUnsafeBytes { blob.append(contentsOf: $0) }
+            case 1: v.map { Float16($0) }.withUnsafeBytes { blob.append(contentsOf: $0) }
+            default: v.map { Self.bf16($0) }.withUnsafeBytes { blob.append(contentsOf: $0) }
+            }
+        }
         // One blob: [pad] weights | scales | biases. pad = 2 yields weight
         // rows that are only 2-byte aligned, forcing the scalar kernel.
         var blob = Data(repeating: 0, count: pad)
         packed.withUnsafeBytes { blob.append(contentsOf: $0) }
         let sOff = blob.count
-        scales.withUnsafeBytes { blob.append(contentsOf: $0) }
+        append(scales, to: &blob)
         let bOff = blob.count
-        biases.withUnsafeBytes { blob.append(contentsOf: $0) }
+        append(biases, to: &blob)
         let buf = engine.makeBuffer(blob)
         return MetalShardStore.GPULinear(
             wBuffer: buf, sBuffer: buf, bBuffer: buf, outDim: O, inDim: I,
-            isQuantized: true, groupSize: group, bits: bits, scalesType: 0,
+            isQuantized: true, groupSize: group, bits: bits, scalesType: scalesType,
             wOff: pad, sOff: sOff, bOff: bOff
         )
     }
@@ -249,6 +257,103 @@ import Testing
         try Self.expectBatchMatches(engine, lin, label: "single slot", tokens: 1)
         try Self.expectBatchMatches(
             engine, lin, label: "split table", tokens: 513, expectedBatchDispatches: 2)
+    }
+
+    // MARK: - Multi-GEMV
+
+    /// Lays the jobs' outputs end to end in y with a 2-float gap, each job
+    /// reading x at its own offset; `rows` below outDim gives partial slices.
+    static func gemvJobs(
+        _ lins: [MetalShardStore.GPULinear], rows: [Int]? = nil
+    ) -> [MetalEngine.GemvJob] {
+        var y = 5
+        return lins.enumerated().map { i, lin in
+            let r = rows?[i] ?? lin.outDim
+            defer { y += r + 2 }
+            return MetalEngine.GemvJob(lin: lin, rows: r, xOff: 3 * i, yOff: y)
+        }
+    }
+
+    /// Runs `jobs` through encodeGemvs with batching off and on, requiring
+    /// bitwise-equal outputs, one dispatch per job unbatched, and
+    /// `batchedDispatches` batched.
+    static func expectGemvsMatch(
+        _ engine: MetalEngine, _ jobs: [MetalEngine.GemvJob], label: String,
+        batchedDispatches: Int
+    ) throws {
+        let xFloats = jobs.map { $0.xOff + $0.lin.inDim }.max()!
+        let yFloats = jobs.map { $0.yOff + $0.rows }.max()! + 3
+        var rng = Rand(777)
+        let xBuf = engine.makeBuffer((0..<xFloats).map { _ in rng.float() })
+        func run(batch: Bool) throws -> (y: [Float], dispatches: Int) {
+            let yBuf = engine.device.makeBuffer(length: yFloats * 4)!
+            memset(yBuf.contents(), 0, yFloats * 4)
+            let dispatches = try runEncoded(engine) { enc in
+                try engine.encodeGemvs(enc, jobs, x: xBuf, y: yBuf, batch: batch)
+            }
+            return (floats(yBuf, yFloats), dispatches)
+        }
+        let single = try run(batch: false)
+        let batched = try run(batch: true)
+        #expect(single.dispatches == jobs.count, "\(label): unbatched dispatch count")
+        #expect(batched.dispatches == batchedDispatches, "\(label): batched dispatch count")
+        #expect(single.y.map(\.bitPattern) == batched.y.map(\.bitPattern),
+                "\(label): gemv_affine_fast_multi diverges bitwise from per-GEMV dispatches")
+        let written = jobs.allSatisfy { j in single.y[j.yOff..<j.yOff + j.rows].contains { $0 != 0 } }
+        #expect(written, "\(label): a job wrote nothing")
+    }
+
+    /// gemv_affine_fast_multi matches one dispatch per GEMV bitwise for both
+    /// bit widths and every scale dtype, with partial row counts, nonzero
+    /// weight offsets, two slices of one buffer, mixed shapes that split into
+    /// groups, jobs only the per-GEMV kernels take, and more than 24 slices.
+    @Test func multiGemvMatchesPerGemvDispatchesBitwise() throws {
+        let engine = try MetalEngine()
+        for bits in [4, 8] {
+            for scalesType: UInt32 in [0, 1, 2] {
+                let lins = (0..<5).map {
+                    Self.quantizedLinear(engine, bits: bits, pad: 4 * $0, outDim: 40 + 8 * $0,
+                                         scalesType: scalesType, seed: UInt64($0))
+                }
+                try Self.expectGemvsMatch(
+                    engine, Self.gemvJobs(lins, rows: [40, 17, 56, 1, 72]),
+                    label: "q\(bits) scales \(scalesType)", batchedDispatches: 1)
+            }
+
+            // Two experts stacked in one buffer: the second's rows start
+            // past the first's weights, scales and biases.
+            let stacked = Self.quantizedLinear(engine, bits: bits, pad: 0, outDim: 96,
+                                               group: 64, scalesType: 2, seed: 9)
+            var lower = stacked, upper = stacked
+            lower.outDim = 48; upper.outDim = 48
+            upper.wOff += 48 * stacked.inDim * bits / 8
+            upper.sOff += 48 * (stacked.inDim / 64) * 2
+            upper.bOff += 48 * (stacked.inDim / 64) * 2
+            try Self.expectGemvsMatch(engine, Self.gemvJobs([lower, upper, lower]),
+                                      label: "q\(bits) one buffer", batchedDispatches: 1)
+
+            let many = (0..<25).map {
+                Self.quantizedLinear(engine, bits: bits, pad: 0, outDim: 8, seed: UInt64($0))
+            }
+            try Self.expectGemvsMatch(engine, Self.gemvJobs(many),
+                                      label: "q\(bits) 25 slices", batchedDispatches: 2)
+        }
+
+        // Three q4 jobs share one dispatch and two q8 jobs another; a q4 job
+        // with another group size is alone, as are the 2-byte-aligned and the
+        // plain one: 5 dispatches.
+        let mixed = [
+            Self.quantizedLinear(engine, bits: 4, pad: 0, seed: 1),
+            Self.quantizedLinear(engine, bits: 8, pad: 0, seed: 2),
+            Self.quantizedLinear(engine, bits: 4, pad: 2, seed: 3),
+            Self.quantizedLinear(engine, bits: 4, pad: 4, seed: 4),
+            Self.plainLinear(engine, dtype: 2),
+            Self.quantizedLinear(engine, bits: 8, pad: 8, seed: 5),
+            Self.quantizedLinear(engine, bits: 4, pad: 0, group: 64, seed: 6),
+            Self.quantizedLinear(engine, bits: 4, pad: 12, seed: 7),
+        ]
+        try Self.expectGemvsMatch(engine, Self.gemvJobs(mixed),
+                                  label: "mixed shapes", batchedDispatches: 5)
     }
 
     // MARK: - S1b non-GEMV batch twins

@@ -839,6 +839,112 @@ public final class MetalEngine {
         )
     }
 
+    /// One GEMV to encode: `lin` (with any stacked-expert offsets already
+    /// folded into its byte offsets), the rows to compute, and where x is read
+    /// and y written (in floats).
+    struct GemvJob {
+        var lin: MetalShardStore.GPULinear
+        var rows: Int
+        var xOff: Int
+        var yOff: Int
+    }
+
+    /// Projections `gemv_affine_fast_multi` takes in one dispatch.
+    static let maxGemvSlices = 24
+
+    /// Why two jobs may share a `gemv_affine_fast_multi` dispatch: the same
+    /// input width, group size, bit width and scale dtype.
+    struct MultiGemvShape: Hashable {
+        var inDim: Int, groupSize: Int, bits: Int, scalesType: UInt32
+    }
+
+    /// The shape under which `job` can join a multi-GEMV dispatch, or nil when
+    /// it needs its own: not quantized, not 4 or 8 bits under the fast
+    /// kernels' alignment and group conditions, or weights, scales and biases
+    /// split across buffers.
+    static func multiGemvShape(_ job: GemvJob) -> MultiGemvShape? {
+        let lin = job.lin
+        guard fastGemvEnabled, lin.isQuantized, lin.wOff % 4 == 0,
+              lin.wBuffer === lin.sBuffer, lin.wBuffer === lin.bBuffer else { return nil }
+        guard (lin.bits == 4 && lin.groupSize % 8 == 0) || (lin.bits == 8 && lin.groupSize % 4 == 0)
+        else { return nil }
+        return MultiGemvShape(inDim: lin.inDim, groupSize: lin.groupSize,
+                              bits: lin.bits, scalesType: lin.scalesType)
+    }
+
+    /// Encodes independent GEMVs (no job reads another's output) over the same
+    /// `x` and `y` buffers with as few dispatches as possible: jobs sharing a
+    /// multi-GEMV shape go together, up to 24 at a time; the rest each get
+    /// `encodeGemv`. Every job's rows are bitwise what its own `encodeGemv`
+    /// writes. With `batch` false, every job gets its own dispatch.
+    func encodeGemvs(
+        _ enc: MTLComputeCommandEncoder, _ jobs: [GemvJob],
+        x: MTLBuffer, y: MTLBuffer, batch: Bool = true
+    ) throws {
+        var groups: [MultiGemvShape: [GemvJob]] = [:]
+        var order: [MultiGemvShape] = []
+        for job in jobs {
+            guard batch, let shape = Self.multiGemvShape(job) else {
+                try encodeGemv(enc, job.lin, rows: job.rows, x: x, xOff: job.xOff, y: y, yOff: job.yOff)
+                continue
+            }
+            if groups[shape] == nil { order.append(shape) }
+            groups[shape, default: []].append(job)
+        }
+        for shape in order {
+            let group = groups[shape]!
+            var start = 0
+            while start < group.count {
+                let chunk = Array(group[start..<min(start + Self.maxGemvSlices, group.count)])
+                if chunk.count == 1 {
+                    let j = chunk[0]
+                    try encodeGemv(enc, j.lin, rows: j.rows, x: x, xOff: j.xOff, y: y, yOff: j.yOff)
+                } else {
+                    try encodeMultiGemv(enc, chunk, shape: shape, x: x, y: y)
+                }
+                start += chunk.count
+            }
+        }
+    }
+
+    /// Mirrors the kernel's GemvSlice (three 64-bit offsets, four 32-bit fields).
+    private struct GemvSliceParams {
+        var wOff: UInt64, sOff: UInt64, bOff: UInt64
+        var outDim: UInt32, rowStart: UInt32, xOff: UInt32, yOff: UInt32
+    }
+
+    private func encodeMultiGemv(
+        _ enc: MTLComputeCommandEncoder, _ jobs: [GemvJob], shape: MultiGemvShape,
+        x: MTLBuffer, y: MTLBuffer
+    ) throws {
+        enc.setComputePipelineState(try pipeline("gemv_affine_fast_multi"))
+        var slices: [GemvSliceParams] = []
+        slices.reserveCapacity(jobs.count)
+        var rows = 0
+        for j in jobs {
+            slices.append(GemvSliceParams(
+                wOff: UInt64(j.lin.wOff), sOff: UInt64(j.lin.sOff), bOff: UInt64(j.lin.bOff),
+                outDim: UInt32(j.rows), rowStart: UInt32(rows),
+                xOff: UInt32(j.xOff), yOff: UInt32(j.yOff)))
+            rows += j.rows
+        }
+        var dims = SIMD4<UInt32>(UInt32(shape.inDim), UInt32(shape.groupSize),
+                                 UInt32(shape.bits) | (shape.scalesType << 8), UInt32(jobs.count))
+        enc.setBuffer(x, offset: 0, index: 0)
+        enc.setBuffer(y, offset: 0, index: 1)
+        slices.withUnsafeBytes { enc.setBytes($0.baseAddress!, length: $0.count, index: 2) }
+        enc.setBytes(&dims, length: MemoryLayout<SIMD4<UInt32>>.stride, index: 3)
+        // Unused slice arguments repeat a real buffer so every declared
+        // argument is bound; the kernel never selects past the slice count.
+        for i in 0..<Self.maxGemvSlices {
+            enc.setBuffer(jobs[min(i, jobs.count - 1)].lin.wBuffer, offset: 0, index: 4 + i)
+        }
+        dispatchThreads(
+            enc, threads: MTLSize(width: 32, height: rows, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+    }
+
     func encodeSiluMul(
         _ enc: MTLComputeCommandEncoder,
         buf: MTLBuffer, count: Int, gOff: Int, uOff: Int, dstOff: Int
