@@ -248,6 +248,30 @@ import Testing
         try Self.expectBatchMatches(engine, Self.plainLinear(engine, dtype: 2), label: "plain bf16")
     }
 
+    /// Both tile shapes (rows x tokens per simdgroup) match per-token
+    /// dispatches bitwise, including tail rows (45 is no multiple of either)
+    /// and tail tokens, for every scale dtype and both bit widths.
+    @Test func gemvTilesMatchPerTokenBitwise() throws {
+        let engine = try MetalEngine()
+        for bits in [4, 8] {
+            for scalesType: UInt32 in [0, 1, 2] {
+                let lin = Self.quantizedLinear(
+                    engine, bits: bits, pad: 0, outDim: 45, inDim: 256,
+                    scalesType: scalesType, seed: UInt64(bits))
+                for shape in [(4, 2), (8, 2)] {
+                    engine.gemvTileOverride = shape
+                    for tokens in [2, 3, 9, 17] {
+                        try Self.expectBatchMatches(
+                            engine, lin,
+                            label: "q\(bits) s\(scalesType) tile r\(shape.0)t\(shape.1) n\(tokens)",
+                            tokens: tokens)
+                    }
+                }
+            }
+        }
+        engine.gemvTileOverride = nil
+    }
+
     /// A single slot delegates to the unbatched encode (one dispatch, same
     /// bytes as the decode schedule); a table past the setBytes ceiling
     /// splits into ceil(n / 512) dispatches, still bitwise.

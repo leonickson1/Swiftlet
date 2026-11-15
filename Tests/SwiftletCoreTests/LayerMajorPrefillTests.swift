@@ -115,7 +115,27 @@ import Testing
     @Test func defaultPrefillModeIsLayerMajor() throws {
         let dir = Self.fixturesDir.appendingPathComponent("tiny-model-q4")
         let model = try QwenMetalModel(modelDir: dir)
-        #expect(model.prefillMode == .layerMajor(chunkTokens: 32))
+        #expect(model.prefillMode == .layerMajor(chunkTokens: 512))
+    }
+
+    /// The chunk cap: scratch always bounds it; the expert cache bounds it
+    /// only when it holds fewer slots than a layer has experts, and then at
+    /// slots / top-k, so a chunk's union always fits.
+    @Test func prefillChunkCapFitsCacheAndScratch() {
+        func cap(_ slots: Int?, _ perToken: Int = 1000) -> Int {
+            QwenMetalModel.prefillChunkCap(
+                cacheSlots: slots, expertsPerLayer: 256, topK: 8,
+                scratchBytesPerToken: perToken, scratchBudgetBytes: 512_000)
+        }
+        #expect(cap(nil) == 512)
+        #expect(cap(4854) == 512)
+        #expect(cap(256) == 512)
+        #expect(cap(255) == 31)
+        #expect(cap(16) == 2)
+        #expect(cap(4) == 1)
+        #expect(cap(nil, 4000) == 128)
+        #expect(cap(100, 4000) == 12)
+        #expect(cap(nil, 10_000_000) == 1)
     }
 
     static func compare(

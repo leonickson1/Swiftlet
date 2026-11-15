@@ -600,7 +600,7 @@ default:
     print("  swiftlet info <model>            model budget summary (\(ArchConfig.known.keys.sorted().joined(separator: " | ")))")
     print("  swiftlet verify <model-dir> <fixtures.safetensors>   compare CPU forward vs mlx fixture")
     print("  swiftlet dump-tensor <model-dir> <module-path> <out.safetensors>   dequantized f32 weights of one module")
-    print("  swiftlet generate <model-dir> --prompt \"...\" [--max-new 32] [--chat] [--gpu] [--cache-gb 8] [--prefill-chunk 32] [--lazy] [--trace-steps out.jsonl]")
+    print("  swiftlet generate <model-dir> --prompt \"...\" [--max-new 32] [--chat] [--gpu] [--cache-gb 8] [--prefill-chunk 512] [--lazy] [--trace-steps out.jsonl]")
     print("  swiftlet generate <model-dir> --gpu --prompts-file suite.jsonl [--answers out.jsonl] [--trace-steps out.jsonl] [--max-new 256] [--cache-gb 8]")
     print("  swiftlet chat <model-dir> [\"turn\" ...] [--max-new 256] [--cache-gb 8] [--greedy] [--system \"...\"]")
     print("")
