@@ -143,6 +143,7 @@ public final class ExpertCache {
     func buffers(layer: Int, experts: [Int]) throws -> [MTLBuffer] {
         let trace = self.trace
         let start = trace == nil ? 0 : ProcessInfo.processInfo.systemUptime
+        reapFinishedPrefetches()
         tick += 1
         var protectedSlots = Set<Int>()
         var result: [MTLBuffer] = []
@@ -156,8 +157,9 @@ public final class ExpertCache {
             let k = key(layer, e)
             let f = freq[k, default: 0] + 1
             freq[k] = f
-            if let s = keyToSlot[k] {
+            if let s = keyToSlot[k], settle(slot: s) {
                 hits += 1
+                if prefetchedUnused.remove(k) != nil { prefetchUsed += 1 }
                 slotLastUse[s] = tick
                 slotFreq[s] = f
                 protectedSlots.insert(s)
@@ -166,7 +168,18 @@ public final class ExpertCache {
                 continue
             }
             misses += 1
-            let s = try slotForFill(excluding: protectedSlots)
+            let s: Int
+            if inFlight.isEmpty {
+                s = try slotForFill(excluding: protectedSlots)
+            } else if let free = try? slotForFill(excluding: protectedSlots.union(inFlight.keys)) {
+                s = free
+            } else {
+                // Every evictable slot is still being read ahead: let those
+                // reads land, then pick from the whole pool as usual.
+                drainPrefetches()
+                s = try slotForFill(excluding: protectedSlots)
+            }
+            if slotKey[s] >= 0 { prefetchedUnused.remove(slotKey[s]) }
             if slotKey[s] >= 0 { keyToSlot.removeValue(forKey: slotKey[s]) }
             slotKey[s] = k
             keyToSlot[k] = s
@@ -221,7 +234,139 @@ public final class ExpertCache {
                 layer: layer, experts: experts, outcomes: outcomes,
                 seconds: ProcessInfo.processInfo.systemUptime - start))
         }
+        // These slots feed the next command buffer; a prefetch issued while
+        // it runs must not overwrite them.
+        lastBatchSlots = protectedSlots
         return result
+    }
+
+    // MARK: - Lookahead prefetch
+
+    /// One background read batch. Its slots stay off-limits to eviction, and
+    /// a request for one of them waits on `group`, until the batch is reaped.
+    private final class InFlight: @unchecked Sendable {
+        let group = DispatchGroup()
+        private let lock = NSLock()
+        private var didFail = false
+        var failed: Bool { lock.lock(); defer { lock.unlock() }; return didFail }
+        func fail() { lock.lock(); didFail = true; lock.unlock() }
+    }
+
+    /// Everything a background batch touches. The destinations are retained
+    /// until the reads land, even if the cache is replaced meanwhile.
+    private struct PrefetchJob: @unchecked Sendable {
+        let reader: QpackExpertReader
+        let layer: Int
+        let requests: [(expert: Int, into: UnsafeMutableRawPointer)]
+        let destinations: [MTLBuffer]
+        let batch: InFlight
+    }
+
+    private static let prefetchQueue = DispatchQueue(
+        label: "swiftlet.expert-prefetch", qos: .userInitiated, attributes: .concurrent)
+
+    /// Slot -> the background batch reading into it, until reaped.
+    private var inFlight: [Int: InFlight] = [:]
+    /// Keys admitted by a prefetch and not yet requested.
+    private var prefetchedUnused = Set<Int64>()
+    /// Slots handed out by the latest `buffers` call.
+    private var lastBatchSlots = Set<Int>()
+    private var descriptorsOpen = false
+
+    /// Expert blobs read ahead by `prefetch`.
+    public private(set) var prefetchIssued = 0
+    /// Of those, the ones requested before being evicted.
+    public private(set) var prefetchUsed = 0
+
+    /// Starts background reads of `experts` in `layer` that are not resident,
+    /// so a later `buffers(layer:experts:)` finds them loaded. Admitted blobs
+    /// rank as just used. Never evicts a slot the latest `buffers` call
+    /// handed out (the GPU may be reading it) or one still being read.
+    /// Requests see the same bytes either way; only when they arrive changes.
+    func prefetch(layer: Int, experts: [Int]) throws {
+        reapFinishedPrefetches()
+        if !descriptorsOpen {
+            try reader.openAllDescriptors()
+            descriptorsOpen = true
+        }
+        var excluded = lastBatchSlots.union(inFlight.keys)
+        var requests: [(expert: Int, into: UnsafeMutableRawPointer)] = []
+        var destinations: [MTLBuffer] = []
+        var admitted: [Int] = []
+        for e in experts {
+            let k = key(layer, e)
+            if keyToSlot[k] != nil { continue }
+            guard let s = try? slotForFill(excluding: excluded) else { break }
+            if slotKey[s] >= 0 {
+                prefetchedUnused.remove(slotKey[s])
+                keyToSlot.removeValue(forKey: slotKey[s])
+            }
+            slotKey[s] = k
+            keyToSlot[k] = s
+            slotLastUse[s] = tick
+            slotFreq[s] = freq[k, default: 0]
+            excluded.insert(s)
+            prefetchedUnused.insert(k)
+            requests.append((expert: e, into: slots[s].contents()))
+            destinations.append(slots[s])
+            admitted.append(s)
+        }
+        guard !requests.isEmpty else { return }
+        prefetchIssued += requests.count
+        let batch = InFlight()
+        for s in admitted { inFlight[s] = batch }
+        let job = PrefetchJob(reader: reader, layer: layer, requests: requests,
+                              destinations: destinations, batch: batch)
+        batch.group.enter()
+        Self.prefetchQueue.async {
+            do {
+                try job.reader.readExperts(layer: job.layer, job.requests)
+            } catch {
+                job.batch.fail()
+            }
+            withExtendedLifetime(job.destinations) {}
+            job.batch.group.leave()
+        }
+    }
+
+    /// Waits for every background read to land, then reaps them.
+    func drainPrefetches() {
+        var seen = Set<ObjectIdentifier>()
+        for batch in inFlight.values where seen.insert(ObjectIdentifier(batch)).inserted {
+            batch.group.wait()
+        }
+        reapFinishedPrefetches()
+    }
+
+    /// Retires batches that have finished: their slots become ordinary
+    /// residents, or free if the read failed.
+    private func reapFinishedPrefetches() {
+        guard !inFlight.isEmpty else { return }
+        for (s, batch) in inFlight where batch.group.wait(timeout: .now()) == .success {
+            inFlight.removeValue(forKey: s)
+            if batch.failed { release(slot: s) }
+        }
+    }
+
+    /// True once `slot` holds trustworthy bytes, waiting for a background
+    /// read into it if one is running. A failed read frees the slot.
+    private func settle(slot s: Int) -> Bool {
+        guard let batch = inFlight[s] else { return true }
+        batch.group.wait()
+        inFlight.removeValue(forKey: s)
+        if batch.failed {
+            release(slot: s)
+            return false
+        }
+        return true
+    }
+
+    private func release(slot s: Int) {
+        guard slotKey[s] >= 0 else { return }
+        prefetchedUnused.remove(slotKey[s])
+        keyToSlot.removeValue(forKey: slotKey[s])
+        slotKey[s] = -1
+        slotFreq[s] = 0
     }
 
     /// Victim per `policy` (LFU with recency tie-break, or LRU);
