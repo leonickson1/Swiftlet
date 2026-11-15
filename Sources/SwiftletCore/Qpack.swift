@@ -615,6 +615,13 @@ public final class QpackExpertReader {
         return map
     }
 
+    /// Opens every layer's descriptor now, on the calling thread. After this
+    /// `fds` is never written again, so reads issued from other threads (the
+    /// expert cache's background prefetch) only ever read it.
+    public func openAllDescriptors() throws {
+        for layer in 0..<layout.layerCount { _ = try descriptor(layer: layer) }
+    }
+
     private func descriptor(layer: Int) throws -> Int32 {
         if fds[layer] < 0 {
             let path = dir.appendingPathComponent(String(format: "layer_%02d.bin", layer)).path

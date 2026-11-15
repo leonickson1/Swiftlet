@@ -214,6 +214,9 @@ func runSuite(
                           cache.allocatedSlots, cache.slotCount, cache.hits, cache.misses,
                           total > 0 ? 100 * Double(cache.hits) / Double(total) : 0)
     }
+    if let metal, let line = lookaheadSummary(metal) {
+        summary += "\n" + line
+    }
     let memory = processMemory()
     summary += String(format: "\nmemory: peak footprint %.2f GiB, peak RSS %.2f GiB",
                       Double(memory.peakFootprint) / 1_073_741_824, Double(memory.peakRSS) / 1_073_741_824)

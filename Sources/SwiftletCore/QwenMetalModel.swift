@@ -292,6 +292,33 @@ public final class QwenMetalModel {
     /// gemv_affine_fast_multi. Stays internal.
     var batchGemvs = true
 
+    /// Router lookahead (experimental). Each decode layer's command buffer
+    /// also scores the next layer's router on this layer's MoE input: a
+    /// guess at the next layer's experts, one layer early. `.measure` only
+    /// scores the guesses (`lookaheadStats`); `.prefetch` also reads the
+    /// guessed experts in the background while the next command buffer runs.
+    /// Outputs are identical in every mode; only timing and cache contents
+    /// change. Single-token decode on a .qpack container only.
+    public enum Lookahead: String, Sendable { case off, measure, prefetch }
+    public var lookahead: Lookahead = .off
+    /// Experts guessed per layer; 0 means the model's top-k.
+    public var lookaheadWidth = 0
+
+    /// How the lookahead guesses matched, summed over decode layers.
+    public struct LookaheadStats: Sendable {
+        /// Layers that had a guess to score (all but each token's first).
+        public var layers = 0
+        /// Experts the router picked on those layers.
+        public var picked = 0
+        /// Of those, ones the guess contained.
+        public var guessed = 0
+        /// Picked experts that were not resident when their layer routed.
+        public var cold = 0
+        /// Of those, ones the guess contained: what a prefetch can save.
+        public var coldGuessed = 0
+    }
+    public internal(set) var lookaheadStats = LookaheadStats()
+
     /// Prompt-prefill schedule for multi-token step calls. Single-token
     /// decode steps never consult this.
     public enum PrefillMode: Equatable, Sendable {
@@ -322,6 +349,9 @@ public final class QwenMetalModel {
         var qout = 0, knew = 0, vnew = 0, att = 0, qprep = 0
         var qkvzStage = 0, baStage = 0
         var exp = 0, dexp = 0, sh = 0, shg = 0
+        /// Next layer's router logits, scored on this layer's MoE input
+        /// (router lookahead). Placed last so every other offset is unchanged.
+        var routNext = 0
         var total = 0
     }
     struct FastLayer {
@@ -557,6 +587,7 @@ public final class QwenMetalModel {
         o.dexp = take(K * D)
         o.sh = take(3 * shInter + D)
         o.shg = take(4)
+        o.routNext = take(E)
         o.total = c
         reg = o
 
@@ -1628,6 +1659,39 @@ extension QwenMetalModel {
             y: slot.scratch, yOff: slot.base + reg.rout)
     }
 
+    /// Router lookahead: the next layer's router logits on this layer's MoE
+    /// input, which the router probe has just normed into `xmoe`. Encoded
+    /// after the probe's barrier, so it reads the finished input.
+    private func encLookahead(
+        _ enc: MTLComputeCommandEncoder, layer li: Int, slot: TokenSlot
+    ) throws {
+        guard lookahead != .off, expertCache != nil, li + 1 < config.numHiddenLayers else { return }
+        try engine.encodeGemv(enc, layers[li + 1].moe.gate, x: slot.scratch,
+            xOff: slot.base + reg.xmoe, y: slot.scratch, yOff: slot.base + reg.routNext)
+    }
+
+    /// The next layer's likely experts: the highest lookahead logits.
+    private func lookaheadGuess(slot: TokenSlot) -> [Int] {
+        let width = lookaheadWidth > 0 ? lookaheadWidth : config.numExpertsPerTok
+        let logits = readSlot(slot, reg.routNext, config.numExperts)
+        return logits.indices.sorted { logits[$0] > logits[$1] }.prefix(width).map { $0 }
+    }
+
+    /// Scores a guess against the layer's real picks, before they are fetched.
+    private func scoreLookahead(_ guess: [Int], picks: [Int], layer li: Int, cache: ExpertCache) {
+        let guessed = Set(guess)
+        lookaheadStats.layers += 1
+        lookaheadStats.picked += picks.count
+        for e in picks {
+            let hit = guessed.contains(e)
+            if hit { lookaheadStats.guessed += 1 }
+            if cache.residentSlot(layer: li, expert: e) == nil {
+                lookaheadStats.cold += 1
+                if hit { lookaheadStats.coldGuessed += 1 }
+            }
+        }
+    }
+
     /// Final norm + vocabulary projection for the slot's hidden row.
     private func encFinalLMHead(_ enc: MTLComputeCommandEncoder, slot: TokenSlot) throws {
         enc.setComputePipelineState(try engine.pipeline("norm_copy"))
@@ -1663,6 +1727,8 @@ extension QwenMetalModel {
 
         let slot = legacySlot
         var pending: PendingMoE? = nil
+        /// The lookahead's guess for the layer about to route.
+        var guess: [Int]? = nil
 
         for li in 0..<cfg.numHiddenLayers {
             try checkGenerationCancellation(shouldCancel)
@@ -1680,6 +1746,7 @@ extension QwenMetalModel {
                 }
                 try phase(.router) {
                     try encRouterProbe(enc, moeGate: L.moe.gate, fl: fl, slot: slot)
+                    try encLookahead(enc, layer: li, slot: slot)
                 }
                 enc.endEncoding()
                 commitAndWait(cb)
@@ -1707,6 +1774,7 @@ extension QwenMetalModel {
                 }
                 try phase(.router) {
                     try encRouterProbe(enc, moeGate: L.moe.gate, fl: fl, slot: slot)
+                    try encLookahead(enc, layer: li, slot: slot)
                 }
                 enc.endEncoding()
                 commitAndWait(cb)
@@ -1721,7 +1789,19 @@ extension QwenMetalModel {
             var bufs: [MTLBuffer] = []
             if let cache = expertCache {
                 try checkGenerationCancellation(shouldCancel)
-                bufs = try fetchExperts(cache, layer: li, experts: picks.map { $0.0 })
+                let ids = picks.map { $0.0 }
+                if let g = guess {
+                    scoreLookahead(g, picks: ids, layer: li, cache: cache)
+                }
+                bufs = try fetchExperts(cache, layer: li, experts: ids)
+                guess = nil
+                if lookahead != .off, li + 1 < cfg.numHiddenLayers {
+                    let next = lookaheadGuess(slot: slot)
+                    guess = next
+                    if lookahead == .prefetch {
+                        try cache.prefetch(layer: li + 1, experts: next)
+                    }
+                }
             }
             pending = PendingMoE(bufs: bufs, weights: weights, stacksLayer: li, picks: picks)
         }

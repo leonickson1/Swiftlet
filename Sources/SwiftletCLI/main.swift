@@ -264,6 +264,20 @@ func loadInferenceModel(_ url: URL) throws -> any InferenceModel {
         if let cache = metal.expertCache {
             FileHandle.standardError.write(Data("expert cache policy: \(cache.policy.rawValue)\n".utf8))
         }
+        // --lookahead measure|prefetch: score the next layer's router on each
+        // layer's MoE input; prefetch also reads the guessed experts in the
+        // background (experimental). --lookahead-width N guesses N experts.
+        if let name = flagValue(CommandLine.arguments, "--lookahead") {
+            guard let mode = QwenMetalModel.Lookahead(rawValue: name), metal.expertCache != nil else {
+                FileHandle.standardError.write(Data("--lookahead takes off, measure or prefetch, on a .qpack container\n".utf8))
+                exit(2)
+            }
+            metal.lookahead = mode
+            if let w = flagValue(CommandLine.arguments, "--lookahead-width"), let width = Int(w), width > 0 {
+                metal.lookaheadWidth = width
+            }
+            FileHandle.standardError.write(Data("router lookahead: \(mode.rawValue)\n".utf8))
+        }
         // S3b follow-up: what the device's counters can actually sample, and
         // whether the per-phase GPU split is measured or honestly absent.
         let split: String
@@ -445,7 +459,26 @@ func runGenerate(modelDir: String, prompt: String, maxNew: Int, chat: Bool, rawI
             Double(cache.budgetBytes) / 1_073_741_824,
             cache.hits, cache.misses, total > 0 ? 100 * Double(cache.hits) / Double(total) : 0
         ).utf8))
+        if let line = lookaheadSummary(metal) {
+            FileHandle.standardError.write(Data((line + "\n").utf8))
+        }
     }
+}
+
+/// One line on how the router lookahead did, or nil when it is off.
+func lookaheadSummary(_ metal: QwenMetalModel) -> String? {
+    guard metal.lookahead != .off else { return nil }
+    let s = metal.lookaheadStats
+    let width = metal.lookaheadWidth > 0 ? metal.lookaheadWidth : metal.config.numExpertsPerTok
+    func pct(_ a: Int, _ b: Int) -> Double { b > 0 ? 100 * Double(a) / Double(b) : 0 }
+    var line = String(format: "lookahead (%@, width %d): guessed %.1f%% of picks over %d layers; %d of %d cold experts guessed (%.1f%%)",
+                      metal.lookahead.rawValue, width, pct(s.guessed, s.picked), s.layers,
+                      s.coldGuessed, s.cold, pct(s.coldGuessed, s.cold))
+    if metal.lookahead == .prefetch, let cache = metal.expertCache {
+        line += String(format: "; prefetched %d blobs, %d used (%.1f%%)",
+                       cache.prefetchIssued, cache.prefetchUsed, pct(cache.prefetchUsed, cache.prefetchIssued))
+    }
+    return line
 }
 
 /// Multi-turn chat through SwiftletSession — the exact code path the app
@@ -576,6 +609,8 @@ default:
     print("  --lazy      CPU path only: ~3 GB peak instead of ~10-14 GB, slower per step")
     print("  --cache-policy  with --gpu on a .qpack: expert cache eviction, lru (default) or lfu")
     print("  --no-page-cache  with --gpu on a .qpack: expert misses bypass the OS file cache, so each is a device read (experiment control)")
+    print("  --lookahead      with --gpu on a .qpack: measure or prefetch, guess each next layer's experts from its router (experimental)")
+    print("  --lookahead-width  experts guessed per layer with --lookahead (default: the model's top-k)")
     print("  --prompts-file  run every prompt in a JSONL suite back to back in one process (one model, one expert cache); see docs/CACHE_SUITE.md")
     print("  --trace-steps  with --gpu on a .qpack: one JSON line per step (timing, expert fetch tiers, routing); see docs/CACHE_AB.md")
 }
