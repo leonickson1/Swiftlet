@@ -6,6 +6,11 @@ using namespace metal;
 // one scale+bias per `groupSize` inputs. Scales dtype is runtime-selected:
 // 0 = f32, 1 = f16, 2 = bf16 (raw ushort, exponent-aligned to f32).
 
+// The fast GEMV family (single, multi, batch and tile kernels) compiles under
+// `#pragma METAL fp math_mode(safe)`: fast math lets the compiler regroup each
+// kernel's sums its own way, and the batched prefill relies on every variant
+// producing exactly the single-token kernel's bits.
+
 // All weight pointers are bound at buffer base with ELEMENT offsets passed in
 // params, because safetensors tensors sit at arbitrary (2-byte-aligned) file
 // offsets inside a whole-shard mmap. Packed words are therefore read as two
@@ -226,6 +231,7 @@ kernel void gemv_affine_fast(
     uint2 tpg [[thread_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
 {
+#pragma METAL fp math_mode(safe)
     const uint row = tpg.y;
     if (row >= p.outDim) return;
     const uint packedCols = p.inDim / 8;           // uint32 words per row
@@ -298,6 +304,7 @@ kernel void gemv_affine_fast_multi(
     uint2 tpg [[thread_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
 {
+#pragma METAL fp math_mode(safe)
     uint z = 0;
     while (z + 1 < shape.w && tpg.y >= sl[z + 1].rowStart) ++z;
     const uint row = tpg.y - sl[z].rowStart;
@@ -384,6 +391,7 @@ kernel void gemv_affine_fast8(
     uint2 tpg [[thread_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
 {
+#pragma METAL fp math_mode(safe)
     const uint row = tpg.y;
     if (row >= p.outDim) return;
     const uint packedCols = p.inDim / 4;           // uint32 words per row
@@ -503,6 +511,7 @@ kernel void gemv_affine_fast_batch(
     uint3 tpg [[thread_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
 {
+#pragma METAL fp math_mode(safe)
     const uint row = tpg.y;
     if (row >= p.outDim) return;
     const uint xOff = offs[tpg.z].x;
@@ -550,6 +559,7 @@ kernel void gemv_affine_fast8_batch(
     uint3 tpg [[thread_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]])
 {
+#pragma METAL fp math_mode(safe)
     const uint row = tpg.y;
     if (row >= p.outDim) return;
     const uint xOff = offs[tpg.z].x;
@@ -581,6 +591,176 @@ kernel void gemv_affine_fast8_batch(
     acc = simd_sum(acc);
     if (lane == 0) y[yOff + row] = acc;
 }
+
+// ===== Prefill tiles: the token-batched GEMV with operand reuse. =====
+// One simdgroup computes R output rows for T token slots. Each lane still
+// owns groups g = lane, lane + 32, ... and walks a group's words in order, so
+// every (row, token) qdot, xsum and acc is the single-token kernel's
+// arithmetic verbatim and simd_sum reduces the same 32 partials: outputs are
+// bitwise gemv_affine_fast's (gemv_affine_fast8's). What changes is reuse:
+// each weight word is loaded and unpacked once for T tokens, and each
+// token's inputs are loaded (and summed into xsum) once for R rows instead
+// of once per row. Tail rows and tokens clamp their loads to the last valid
+// one and skip the store. The grid is (32, ceil(rows / R), ceil(slots / T)).
+#define GEMV_TILE_ARGS \
+    device const float *x       [[buffer(0)]], \
+    device const uchar *w       [[buffer(1)]], \
+    device const uchar *scales  [[buffer(2)]], \
+    device const uchar *biases  [[buffer(3)]], \
+    device float       *y       [[buffer(4)]], \
+    constant GemvParams &p      [[buffer(5)]], \
+    constant uint2     *offs    [[buffer(6)]], \
+    constant uint      &slots   [[buffer(7)]], \
+    uint3 tg [[threadgroup_position_in_grid]], \
+    uint lane [[thread_index_in_simdgroup]]
+
+template <uint R, uint T>
+kernel void gemv_affine_fast_tile(GEMV_TILE_ARGS)
+{
+#pragma METAL fp math_mode(safe)
+    const uint row0 = tg.y * R;
+    const uint tok0 = tg.z * T;
+    const uint packedCols = p.inDim / 8;           // uint32 words per row
+    const uint groups = p.inDim / p.groupSize;
+    const uint wordsPerGroup = p.groupSize / 8;
+    uint rows[R];
+    device const uint *wr[R];
+    for (uint r = 0; r < R; ++r) {
+        rows[r] = min(row0 + r, p.outDim - 1);
+        wr[r] = (device const uint *)(w + p.wOff + ulong(rows[r]) * packedCols * 4);
+    }
+    uint xOff[T];
+    for (uint t = 0; t < T; ++t) xOff[t] = offs[min(tok0 + t, slots - 1)].x;
+
+    float acc[R][T];
+    for (uint r = 0; r < R; ++r)
+        for (uint t = 0; t < T; ++t) acc[r][t] = 0;
+    for (uint g = lane; g < groups; g += 32) {
+        float qdot[R][T];
+        float xsum[T];
+        for (uint t = 0; t < T; ++t) {
+            xsum[t] = 0;
+            for (uint r = 0; r < R; ++r) qdot[r][t] = 0;
+        }
+        uint base = g * wordsPerGroup;
+        for (uint wi = 0; wi < wordsPerGroup; ++wi) {
+            float xv[T][8];
+            for (uint t = 0; t < T; ++t) {
+                uint xo = xOff[t] + g * p.groupSize + wi * 8;
+                for (uint j = 0; j < 8; ++j) xv[t][j] = x[xo + j];
+                xsum[t] += xv[t][0] + xv[t][1] + xv[t][2] + xv[t][3]
+                         + xv[t][4] + xv[t][5] + xv[t][6] + xv[t][7];
+            }
+            for (uint r = 0; r < R; ++r) {
+                uint word = wr[r][base + wi];
+                float w0 = float(word & 0xF);
+                float w1 = float((word >> 4) & 0xF);
+                float w2 = float((word >> 8) & 0xF);
+                float w3 = float((word >> 12) & 0xF);
+                float w4 = float((word >> 16) & 0xF);
+                float w5 = float((word >> 20) & 0xF);
+                float w6 = float((word >> 24) & 0xF);
+                float w7 = float((word >> 28) & 0xF);
+                for (uint t = 0; t < T; ++t) {
+                    qdot[r][t] += w0 * xv[t][0]
+                                + w1 * xv[t][1]
+                                + w2 * xv[t][2]
+                                + w3 * xv[t][3]
+                                + w4 * xv[t][4]
+                                + w5 * xv[t][5]
+                                + w6 * xv[t][6]
+                                + w7 * xv[t][7];
+                }
+            }
+        }
+        for (uint r = 0; r < R; ++r) {
+            uint gi = rows[r] * groups + g;
+            float s = load_scale(scales, p.sOff, gi, p.scalesType);
+            float b = load_scale(biases, p.bOff, gi, p.scalesType);
+            for (uint t = 0; t < T; ++t) acc[r][t] += s * qdot[r][t] + b * xsum[t];
+        }
+    }
+    for (uint r = 0; r < R; ++r) {
+        for (uint t = 0; t < T; ++t) {
+            float v = simd_sum(acc[r][t]);
+            if (lane == 0 && row0 + r < p.outDim && tok0 + t < slots)
+                y[offs[tok0 + t].y + row0 + r] = v;
+        }
+    }
+}
+
+template <uint R, uint T>
+kernel void gemv_affine_fast8_tile(GEMV_TILE_ARGS)
+{
+#pragma METAL fp math_mode(safe)
+    const uint row0 = tg.y * R;
+    const uint tok0 = tg.z * T;
+    const uint packedCols = p.inDim / 4;           // uint32 words per row
+    const uint groups = p.inDim / p.groupSize;
+    const uint wordsPerGroup = p.groupSize / 4;
+    uint rows[R];
+    device const uint *wr[R];
+    for (uint r = 0; r < R; ++r) {
+        rows[r] = min(row0 + r, p.outDim - 1);
+        wr[r] = (device const uint *)(w + p.wOff + ulong(rows[r]) * packedCols * 4);
+    }
+    uint xOff[T];
+    for (uint t = 0; t < T; ++t) xOff[t] = offs[min(tok0 + t, slots - 1)].x;
+
+    float acc[R][T];
+    for (uint r = 0; r < R; ++r)
+        for (uint t = 0; t < T; ++t) acc[r][t] = 0;
+    for (uint g = lane; g < groups; g += 32) {
+        float qdot[R][T];
+        float xsum[T];
+        for (uint t = 0; t < T; ++t) {
+            xsum[t] = 0;
+            for (uint r = 0; r < R; ++r) qdot[r][t] = 0;
+        }
+        uint base = g * wordsPerGroup;
+        for (uint wi = 0; wi < wordsPerGroup; ++wi) {
+            float xv[T][4];
+            for (uint t = 0; t < T; ++t) {
+                uint xo = xOff[t] + g * p.groupSize + wi * 4;
+                for (uint j = 0; j < 4; ++j) xv[t][j] = x[xo + j];
+                xsum[t] += xv[t][0] + xv[t][1] + xv[t][2] + xv[t][3];
+            }
+            for (uint r = 0; r < R; ++r) {
+                uint word = wr[r][base + wi];
+                float w0 = float(word & 0xFF);
+                float w1 = float((word >> 8) & 0xFF);
+                float w2 = float((word >> 16) & 0xFF);
+                float w3 = float((word >> 24) & 0xFF);
+                for (uint t = 0; t < T; ++t) {
+                    qdot[r][t] += w0 * xv[t][0]
+                                + w1 * xv[t][1]
+                                + w2 * xv[t][2]
+                                + w3 * xv[t][3];
+                }
+            }
+        }
+        for (uint r = 0; r < R; ++r) {
+            uint gi = rows[r] * groups + g;
+            float s = load_scale(scales, p.sOff, gi, p.scalesType);
+            float b = load_scale(biases, p.bOff, gi, p.scalesType);
+            for (uint t = 0; t < T; ++t) acc[r][t] += s * qdot[r][t] + b * xsum[t];
+        }
+    }
+    for (uint r = 0; r < R; ++r) {
+        for (uint t = 0; t < T; ++t) {
+            float v = simd_sum(acc[r][t]);
+            if (lane == 0 && row0 + r < p.outDim && tok0 + t < slots)
+                y[offs[tok0 + t].y + row0 + r] = v;
+        }
+    }
+}
+
+#define GEMV_TILE(name, R, T) \
+    template [[host_name(#name "_r" #R "t" #T)]] kernel void name<R, T>(GEMV_TILE_ARGS);
+GEMV_TILE(gemv_affine_fast_tile, 4, 2)
+GEMV_TILE(gemv_affine_fast_tile, 8, 2)
+GEMV_TILE(gemv_affine_fast8_tile, 4, 2)
+GEMV_TILE(gemv_affine_fast8_tile, 8, 2)
 
 // ===== S2 full attention: q prep, KV append, gated causal GQA softmax. =====
 // Replaces the fast path's CPU attention core. RoPE trig uses precise::

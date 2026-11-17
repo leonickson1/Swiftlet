@@ -301,6 +301,28 @@ public final class MetalEngine {
         }
     }
 
+    /// A/B switch: SWIFTLET_NO_GEMV_TILE=1 keeps token-batched GEMVs on the
+    /// one-row, one-token kernels instead of the operand-reusing tiles.
+    static let gemvTileEnabled =
+        ProcessInfo.processInfo.environment["SWIFTLET_NO_GEMV_TILE"] != "1"
+
+    /// Per-engine copy of the switch (tests and benchmarks flip it).
+    var gemvTiles = MetalEngine.gemvTileEnabled
+
+    /// Tile shape override (rows x tokens per simdgroup; tests pin each
+    /// instantiated shape). nil picks by input width.
+    var gemvTileOverride: (rows: Int, tokens: Int)?
+
+    /// Rows x tokens per simdgroup for the tiled kernels. Measured on the
+    /// 35B's shapes (M5 Pro): 8 x 2 is fastest when every lane owns a group
+    /// (2.5-5x the one-row kernel); inputs too narrow to fill the simdgroup
+    /// (the 512-wide expert down projection fills 8 of 32 lanes) do best at
+    /// 4 x 2 (about 2.4x). Wider token tiles lose to register pressure.
+    func gemvTileShape(inDim: Int, groupSize: Int) -> (rows: Int, tokens: Int) {
+        if let o = gemvTileOverride { return o }
+        return inDim / groupSize >= 32 ? (8, 2) : (4, 2)
+    }
+
     /// The setBytes offset-table ceiling for one batched GEMV dispatch:
     /// 512 uint2 entries stay well under Metal's 4 KB setBytes limit. Longer
     /// tables split into further dispatches.
@@ -344,7 +366,13 @@ public final class MetalEngine {
                     : lin.bits == 4 && lin.groupSize % 8 == 0 ? "gemv_affine_fast_batch"
                     : lin.bits == 8 && lin.groupSize % 4 == 0 ? "gemv_affine_fast8_batch"
                     : nil
-                enc.setComputePipelineState(try pipeline(fastName ?? "gemv_affine_batch"))
+                let tile = fastName == nil || !gemvTiles ? nil
+                    : gemvTileShape(inDim: lin.inDim, groupSize: lin.groupSize)
+                let name = tile.map {
+                    (lin.bits == 4 ? "gemv_affine_fast_tile" : "gemv_affine_fast8_tile")
+                        + "_r\($0.rows)t\($0.tokens)"
+                }
+                enc.setComputePipelineState(try pipeline(name ?? fastName ?? "gemv_affine_batch"))
                 var p = GemvParams(
                     wOff: UInt64(lin.wOff + wExtra), sOff: UInt64(lin.sOff + sExtra),
                     bOff: UInt64(lin.bOff + bExtra),
@@ -359,7 +387,17 @@ public final class MetalEngine {
                 enc.setBuffer(y, offset: 0, index: 4)
                 enc.setBytes(&p, length: MemoryLayout<GemvParams>.stride, index: 5)
                 table.withUnsafeBytes { enc.setBytes($0.baseAddress!, length: $0.count, index: 6) }
-                if fastName != nil {
+                if let tile {
+                    var count = UInt32(n)
+                    enc.setBytes(&count, length: 4, index: 7)
+                    dispatchThreads(
+                        enc,
+                        threads: MTLSize(width: 32,
+                                         height: (outDim + tile.rows - 1) / tile.rows,
+                                         depth: (n + tile.tokens - 1) / tile.tokens),
+                        threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+                    )
+                } else if fastName != nil {
                     dispatchThreads(
                         enc, threads: MTLSize(width: 32, height: outDim, depth: n),
                         threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)

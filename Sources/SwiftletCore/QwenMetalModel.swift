@@ -333,14 +333,63 @@ public final class QwenMetalModel {
         case layerMajor(chunkTokens: Int)
     }
 
-    /// Default: layer-major with 32-token chunks. One decode-shaped buffer
-    /// sequence per chunk instead of per token, and expert fetches per (layer, union)
-    /// instead of per (token, layer, pick). 32 keeps scratch bounded to a few
-    /// tens of MB on 80B-class configs while letting short prompts run as a
-    /// single chunk; unions saturate toward the full expert set beyond a few
-    /// dozen tokens, so larger chunks add memory faster than they add
-    /// expert-traffic savings. `.tokenMajor` restores the S1a schedule.
-    public var prefillMode: PrefillMode = .layerMajor(chunkTokens: 32)
+    /// Default: layer-major with chunks of up to 512 tokens. One decode-shaped
+    /// buffer sequence per chunk instead of per token, and expert fetches per
+    /// (layer, union) instead of per (token, layer, pick). Unions saturate
+    /// toward the full expert set within a few dozen tokens, so when experts
+    /// stream from storage every extra chunk re-reads nearly a full pass of
+    /// the model; and the tiled GEMVs reuse each weight across the tokens
+    /// routed to it, so more tokens per expert is faster even when resident
+    /// (35B on an M5 Pro, 512-token prompt: 4.3 s of GPU time at 512 vs
+    /// 5.7 s at 64). `prefillChunkCap` bounds the chunk by the expert cache
+    /// and the scratch budget. `.tokenMajor` restores the S1a schedule.
+    public var prefillMode: PrefillMode = .layerMajor(chunkTokens: 512)
+
+    /// After the prompt's final layer-major chunk, every layer's union except
+    /// the experts its last tokens chose is demoted in the expert cache, so
+    /// the cache enters decode holding those experts for every layer rather
+    /// than the whole union of the last layers. Without it the 35B on a 24 GB
+    /// Air missed about 50% of layers 0-9's experts for the first decode
+    /// tokens and decoded about 10% slower over 128 tokens. Bytes in the
+    /// cache are unchanged, so output is too. A/B switch:
+    /// SWIFTLET_NO_PREFILL_DEMOTE=1.
+    static let prefillDemoteEnabled =
+        ProcessInfo.processInfo.environment["SWIFTLET_NO_PREFILL_DEMOTE"] != "1"
+    var prefillDemotesUnion = QwenMetalModel.prefillDemoteEnabled
+
+    /// Scratch the layer-major prefill may hold: chunk tokens x (Regions,
+    /// recurrence staging, hidden row) floats. About 220 MB at 512 tokens
+    /// on the 35B, so phones keep a quarter of that.
+    #if os(iOS)
+    static let prefillScratchBudgetBytes = 64 << 20
+    #else
+    static let prefillScratchBudgetBytes = 256 << 20
+    #endif
+
+    /// The largest chunk the schedule can run. A chunk's union for one layer
+    /// is resident all at once and is at most min(tokens x top-k, experts),
+    /// so a cache with fewer slots than a layer has experts caps the chunk
+    /// at slots / top-k; scratch caps it at the budget.
+    static func prefillChunkCap(
+        cacheSlots: Int?, expertsPerLayer: Int, topK: Int,
+        scratchBytesPerToken: Int, scratchBudgetBytes: Int
+    ) -> Int {
+        var cap = max(1, scratchBudgetBytes / max(1, scratchBytesPerToken))
+        if let slots = cacheSlots, slots < expertsPerLayer {
+            cap = min(cap, max(1, slots / max(1, topK)))
+        }
+        return cap
+    }
+
+    var prefillChunkCap: Int {
+        let cfg = config
+        let staging = 2 * cfg.keyDim + 2 * cfg.valueDim + 2 * cfg.linearNumValueHeads
+        return Self.prefillChunkCap(
+            cacheSlots: expertCache?.slotCount, expertsPerLayer: cfg.numExperts,
+            topK: cfg.numExpertsPerTok,
+            scratchBytesPerToken: (reg.total + staging + cfg.hiddenSize) * 4,
+            scratchBudgetBytes: Self.prefillScratchBudgetBytes)
+    }
 
     // MARK: Fast path (split DeltaNet layout): one command buffer per layer.
     struct Regions {
@@ -1024,7 +1073,7 @@ public final class QwenMetalModel {
         var chunkCapacity = 0
         if tokens.count > 1, sBuf != nil, hBuf != nil,
            case .layerMajor(let chunkTokens) = prefillMode {
-            let wanted = min(max(1, chunkTokens), tokens.count)
+            let wanted = min(max(1, chunkTokens), tokens.count, prefillChunkCap)
             if ensurePrefillCapacity(wanted) { chunkCapacity = wanted }
         }
         if chunkCapacity > 0 {
@@ -2365,6 +2414,11 @@ extension QwenMetalModel {
         }
 
         var pending: PendingChunkMoE?
+        // The decode-facing tail of the prompt: as many final tokens as the
+        // cache holds full top-k picks for in every layer.
+        let keepTokens = expertCache.map {
+            max(1, $0.slotCount / max(1, cfg.numHiddenLayers * cfg.numExpertsPerTok))
+        } ?? S
 
         for li in 0..<cfg.numHiddenLayers {
             let L = layers[li]
@@ -2458,6 +2512,11 @@ extension QwenMetalModel {
             if let cache = expertCache {
                 let bufs = try fetchExperts(cache, layer: li, experts: union)
                 for (i, e) in union.enumerated() { buffers[e] = bufs[i] }
+                if projectLogits && prefillDemotesUnion {
+                    var keep = Set<Int>()
+                    for t in max(0, S - keepTokens)..<S { keep.formUnion(perToken[t].picks.map { $0.0 }) }
+                    cache.demote(layer: li, experts: union.filter { !keep.contains($0) })
+                }
             }
             pending = PendingChunkMoE(
                 layer: li, union: union, buffers: buffers, perToken: perToken)

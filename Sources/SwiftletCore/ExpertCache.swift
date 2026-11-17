@@ -240,6 +240,22 @@ public final class ExpertCache {
         return result
     }
 
+    /// Ranks these resident experts of `layer` below every slot used
+    /// normally, oldest demotion first, so the next fills evict them before
+    /// anything else (under LFU only the recency tie-break moves). The
+    /// layer-major prefill fetches a chunk's whole expert union per layer;
+    /// only what the prompt's last tokens chose predicts decode, and without
+    /// this the late layers' unions push every early layer out of the cache.
+    func demote(layer: Int, experts: [Int]) {
+        for e in experts {
+            if let s = keyToSlot[key(layer, e)] { slotLastUse[s] = tick - Self.demotedOffset }
+        }
+    }
+
+    /// Far below any tick a session reaches, so demoted slots rank under
+    /// every other slot and keep their own order among themselves.
+    private static let demotedOffset = 1 << 40
+
     // MARK: - Lookahead prefetch
 
     /// One background read batch. Its slots stay off-limits to eviction, and
