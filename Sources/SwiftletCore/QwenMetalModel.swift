@@ -345,6 +345,18 @@ public final class QwenMetalModel {
     /// and the scratch budget. `.tokenMajor` restores the S1a schedule.
     public var prefillMode: PrefillMode = .layerMajor(chunkTokens: 512)
 
+    /// After the prompt's final layer-major chunk, every layer's union except
+    /// the experts its last tokens chose is demoted in the expert cache, so
+    /// the cache enters decode holding those experts for every layer rather
+    /// than the whole union of the last layers. Without it the 35B on a 24 GB
+    /// Air missed about 50% of layers 0-9's experts for the first decode
+    /// tokens and decoded about 10% slower over 128 tokens. Bytes in the
+    /// cache are unchanged, so output is too. A/B switch:
+    /// SWIFTLET_NO_PREFILL_DEMOTE=1.
+    static let prefillDemoteEnabled =
+        ProcessInfo.processInfo.environment["SWIFTLET_NO_PREFILL_DEMOTE"] != "1"
+    var prefillDemotesUnion = QwenMetalModel.prefillDemoteEnabled
+
     /// Scratch the layer-major prefill may hold: chunk tokens x (Regions,
     /// recurrence staging, hidden row) floats. About 220 MB at 512 tokens
     /// on the 35B, so phones keep a quarter of that.
@@ -2402,6 +2414,11 @@ extension QwenMetalModel {
         }
 
         var pending: PendingChunkMoE?
+        // The decode-facing tail of the prompt: as many final tokens as the
+        // cache holds full top-k picks for in every layer.
+        let keepTokens = expertCache.map {
+            max(1, $0.slotCount / max(1, cfg.numHiddenLayers * cfg.numExpertsPerTok))
+        } ?? S
 
         for li in 0..<cfg.numHiddenLayers {
             let L = layers[li]
@@ -2495,6 +2512,11 @@ extension QwenMetalModel {
             if let cache = expertCache {
                 let bufs = try fetchExperts(cache, layer: li, experts: union)
                 for (i, e) in union.enumerated() { buffers[e] = bufs[i] }
+                if projectLogits && prefillDemotesUnion {
+                    var keep = Set<Int>()
+                    for t in max(0, S - keepTokens)..<S { keep.formUnion(perToken[t].picks.map { $0.0 }) }
+                    cache.demote(layer: li, experts: union.filter { !keep.contains($0) })
+                }
             }
             pending = PendingChunkMoE(
                 layer: li, union: union, buffers: buffers, perToken: perToken)

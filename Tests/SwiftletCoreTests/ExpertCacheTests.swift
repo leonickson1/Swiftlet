@@ -174,6 +174,31 @@ import Testing
         #expect(cache.allocatedSlots == 16)
     }
 
+    /// Demoted residents are evicted before every resident used normally,
+    /// even one last used earlier (the layer-major prefill relies on this).
+    @Test func demotedExpertsAreEvictedFirst() throws {
+        let out = try Self.repackedTiny()
+        defer { try? FileManager.default.removeItem(at: out) }
+        let device = try #require(MTLCreateSystemDefaultDevice())
+        let cache = try ExpertCache(
+            containerDir: out, device: device,
+            budgetBytes: Self.budget(slots: 16, container: out))
+        let all = Array(0..<cache.reader.layout.expertCount)
+        _ = try cache.buffers(layer: 0, experts: all)   // slots 0-7, oldest
+        _ = try cache.buffers(layer: 1, experts: all)   // slots 8-15
+        cache.demote(layer: 1, experts: [0, 1, 2, 3])
+        _ = try cache.buffers(layer: 2, experts: [0, 1, 2, 3])
+        for e in 0..<4 {
+            #expect(cache.residentSlot(layer: 1, expert: e) == nil, "demoted (1, \(e)) must be evicted first")
+        }
+        for e in all {
+            #expect(cache.residentSlot(layer: 0, expert: e) != nil, "older (0, \(e)) must survive")
+        }
+        for e in 4..<all.count {
+            #expect(cache.residentSlot(layer: 1, expert: e) != nil, "undemoted (1, \(e)) must survive")
+        }
+    }
+
     /// A short read must throw, and the cache must not advertise the batch's
     /// keys as resident afterwards.
     @Test func failedReadLeavesNoResidentKey() throws {
