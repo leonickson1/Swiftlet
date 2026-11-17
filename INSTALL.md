@@ -18,7 +18,7 @@ There are four ways to use it once it is built:
 2. A local OpenAI-compatible HTTP server, `swiftlet-server`, which any tool that
    speaks the OpenAI API can point at.
 3. As a Swift package inside your own macOS or iOS app.
-4. On iPhone, through the Priv AI app or by building
+4. On iPhone, by building the open-source app
    [leonickson1/localLLM](https://github.com/leonickson1/localLLM) yourself.
 
 This guide covers 1 and 2.
@@ -39,6 +39,21 @@ You need:
 You do not need a Metal toolchain, a Python environment, or any model conversion
 tooling. Shaders are compiled at runtime and the containers are prebuilt.
 
+**Want to skip Xcode and the build?** Prebuilt binaries for Apple Silicon are on
+the [Releases page](https://github.com/leonickson1/Swiftlet/releases). Download
+them in Terminal, then go straight to step 3 and run the tools from the
+extracted folder (`./swiftlet-repack`, `./swiftlet`, `./swiftlet-server`) in
+place of `.build/release/...`:
+
+```bash
+curl -L https://github.com/leonickson1/Swiftlet/releases/download/v0.1.0/swiftlet-v0.1.0-macos-arm64.tar.gz | tar xz
+cd swiftlet-v0.1.0-macos-arm64
+```
+
+Downloading with `curl` avoids the macOS warning for unnotarized binaries. If
+you downloaded the archive in a browser, run `xattr -dr com.apple.quarantine .`
+inside the folder first.
+
 ---
 
 ## 1. Install the Swift toolchain
@@ -46,7 +61,8 @@ tooling. Shaders are compiled at runtime and the containers are prebuilt.
 Swiftlet is a Swift package, so you need a Swift compiler. The cleanest way to
 get one that also runs the test suite without extra flags is the full Xcode.
 
-Install **Xcode 16 or later** from the Mac App Store. Wait until the App Store
+Install **Xcode 26 or later** from the Mac App Store. The package needs Swift
+6.2, which Xcode 26 provides; older Xcode versions cannot build it. Wait until the App Store
 reports it as installed and `/Applications/Xcode.app` exists.
 
 Xcode being present is not enough. The command line still points at whatever
@@ -133,11 +149,11 @@ downloaded yet.
 Models are distributed as prebuilt `.qpack` containers. You do not convert
 anything yourself. Pick one tier:
 
-| Model | Disk | Peak RAM | Decode speed (M5) | Use it when |
+| Model | Disk | Peak RAM | Decode (24 GB M5 Air) | Use it when |
 |---|---|---|---|---|
-| 35B 4-bit | 18 GB | 2.6 GB | 7 to 11 tok/s | Default. Best speed and smallest footprint. |
-| 35B 8-bit | 34 GB | 7.6 GB | 3.5 to 4 tok/s | Best writing quality. Removes repetition artifacts the 4-bit build can show on long tasks. |
-| 80B 4-bit | 42 GB | 4.3 GB | 4.5 to 5 tok/s | Largest model. Note RAM is barely higher than the 35B, because only about 3B parameters are active per token either way. |
+| 35B 4-bit | 18 GB | 3.5 GiB (2 GB cache) to 9.5 GiB (8 GB) | about 16 to 17 tok/s | Default. Best speed and smallest footprint. |
+| 35B 8-bit | 34 GB | about 7.6 GB (before v0.1.0) | 3.5 to 4 tok/s (before v0.1.0) | Best writing quality. Removes repetition artifacts the 4-bit build can show on long tasks. |
+| 80B 4-bit | 42 GB | 3.6 GiB (2 GB cache) to 9.6 GiB (8 GB) | about 10.5 tok/s | Largest model. RAM is barely higher than the 35B, because only about 3B parameters are active per token either way. |
 
 If you are not sure, take the **35B 4-bit**.
 
@@ -467,9 +483,10 @@ Rerun the identical `swiftlet-repack` command. It resumes rather than starting
 over.
 
 **Generation is slow to produce the first token on a long prompt**
-That is prefill. Long prompts currently process at roughly decode speed, so a
-large system prompt costs real time before the first token appears. This is the
-top item on the project roadmap.
+That is prefill. Since v0.1.0 prompts are processed in chunks of up to 512
+tokens with batched kernels, about 65 to 70 tokens per second for the 35B on an
+M5 MacBook Air, so a 512-token prompt takes about 8 seconds. Follow-up turns
+only prefill their new text.
 
 **The model gets facts wrong**
 Expected, and worth setting expectations on. Only about 3B parameters are active
