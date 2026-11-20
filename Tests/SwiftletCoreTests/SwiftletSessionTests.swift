@@ -163,11 +163,21 @@ import Testing
                 String(String.UnicodeScalarView(tokens.compactMap { Unicode.Scalar($0) }))
             },
             renderMessages: { messages in
-                switch messages.last?["content"] {
-                case "one": return [10]
-                case "other": return [20]
-                default: return [40]
+                // A transcript renders as the ids each turn was fed: the user
+                // turn's token, then the assistant's reply bytes, then the next
+                // user turn — so a continuation's render begins with exactly
+                // what the state holds and the tail is the new turn alone.
+                var ids: [Int] = []
+                for message in messages {
+                    switch (message["role"], message["content"]) {
+                    case ("assistant", let reply?):
+                        ids += reply.unicodeScalars.map { Int($0.value) }
+                    case (_, "one"): ids.append(10)
+                    case (_, "other"): ids.append(20)
+                    default: ids.append(30)
+                    }
                 }
+                return ids
             },
             generationCleanupHook: cleanupGate.map { gate in { gate.run() } }
         )
@@ -237,8 +247,9 @@ import Testing
         #expect(model.maxActiveCalls == 1)
 
         // The cancelled request was queued, so it must not reset the state
-        // committed by the first request. This exact message shape exercises
-        // continuationIds and should reuse the same DecodeState identity.
+        // committed by the first request. This transcript renders to the ids
+        // the state was fed plus one new token, so the prefix is reused and
+        // only that token is fed to the same DecodeState identity.
         let continuationStream = session.streamChat(
             messages: [
                 ["role": "user", "content": "one"],
