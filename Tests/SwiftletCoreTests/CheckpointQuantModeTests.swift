@@ -332,4 +332,239 @@ import Testing
         }
         #expect(Checkpoint.foreignQuantTensors.map(\.suffix) == ["global_scale", "signs"])
     }
+
+    // MARK: Hugging Face / NVIDIA ModelOpt quantization metadata (mlx-lm `3696eb2`, `load_model`)
+
+    /// Copies the tiny 4-bit fixture, drops mlx-lm's `quantization` block
+    /// unless `keepMLXBlock`, merges `config` into `config.json`, and writes
+    /// `sidecar` as `hf_quant_config.json` beside it when given. The tensors
+    /// stay the fixture's affine ones: the refusal is decided from the
+    /// metadata alone, as mlx-lm's load is.
+    static func checkpoint(hfConfig config: [String: Any], sidecar: [String: Any]? = nil,
+                           keepMLXBlock: Bool = false) throws -> URL {
+        let src = Self.fixturesDir.appendingPathComponent("tiny-model-q4")
+        let dst = FileManager.default.temporaryDirectory
+            .appendingPathComponent("tiny-hfquant-\(UUID().uuidString)")
+        try FileManager.default.copyItem(at: src, to: dst)
+        let cfgURL = dst.appendingPathComponent("config.json")
+        var cfg = try JSONSerialization.jsonObject(with: Data(contentsOf: cfgURL)) as! [String: Any]
+        if !keepMLXBlock { cfg.removeValue(forKey: "quantization") }
+        for (key, value) in config { cfg[key] = value }
+        try JSONSerialization.data(withJSONObject: cfg).write(to: cfgURL)
+        if let sidecar {
+            try JSONSerialization.data(withJSONObject: sidecar)
+                .write(to: dst.appendingPathComponent("hf_quant_config.json"))
+        }
+        return dst
+    }
+
+    /// `quantization_config` as transformers writes it for an fp8 checkpoint
+    /// (`Qwen/Qwen3-Next-80B-A3B-Instruct-FP8`, a family this engine accepts).
+    static var fp8QuantizationConfig: [String: Any] { [
+        "activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8",
+        "modules_to_not_convert": ["lm_head", "model.layers.0.mlp.gate"],
+    ] }
+
+    /// `hf_quant_config.json` as NVIDIA ModelOpt writes it
+    /// (`nvidia/Qwen3-235B-A22B-FP4`, whose `config.json` carries no
+    /// `quantization_config` at all): the algorithm sits under
+    /// `quantization.quant_algo`; there is no `quant_method`.
+    static var modelOptSidecar: [String: Any] { [
+        "producer": ["name": "modelopt", "version": "0.33.0"],
+        "quantization": ["quant_algo": "NVFP4", "kv_cache_quant_algo": "FP8", "group_size": 16,
+                         "exclude_modules": ["model.layers.0.mlp.gate"]],
+    ] }
+
+    static func expectRefused(hfSource source: String, algorithm: String, _ open: () throws -> Void) {
+        do {
+            try open()
+            Issue.record("a checkpoint quantized by \(source) (\(algorithm)) was opened as plain weights")
+        } catch Checkpoint.Error.hfQuantizedCheckpoint(let s, let a) {
+            #expect(s == source, "the refusal must name the file and key the metadata came from")
+            #expect(a == algorithm, "the refusal must name the algorithm the metadata declares")
+            let text = Checkpoint.Error.hfQuantizedCheckpoint(source: s, algorithm: a).description
+            #expect(text.contains(source) && text.contains(algorithm) && text.contains("mlx_lm.convert"),
+                    "the message must name the source, the algorithm and the converter")
+        } catch {
+            Issue.record("refused with \(error), not by the Hugging Face quantization metadata")
+        }
+    }
+
+    /// A transformers `quantization_config` with no mlx-lm `quantization`
+    /// block is refused at open, naming the key and its `quant_method`.
+    /// Before this the directory opened as unquantized (`defaultQuant` nil):
+    /// its packed tensors still answered `isQuantized`, so the first weight
+    /// read failed with `missing tensor model.embed_tokens.scales`, a tensor
+    /// the file contains, and an fp8 checkpoint in Hugging Face layout read
+    /// as plain bf16.
+    @Test func hfQuantizationConfigIsRefusedAtOpen() throws {
+        let dir = try Self.checkpoint(hfConfig: ["quantization_config": Self.fp8QuantizationConfig])
+        defer { try? FileManager.default.removeItem(at: dir) }
+        Self.expectRefused(hfSource: "config.json quantization_config", algorithm: "fp8") {
+            _ = try Checkpoint(dir: dir)
+        }
+    }
+
+    /// A multimodal checkpoint nests the block under `text_config`; mlx-lm
+    /// reads it there when the top level has none, and so does the refusal.
+    @Test func textConfigQuantizationConfigIsRefusedAtOpen() throws {
+        let dir = try Self.checkpoint(hfConfig: [
+            "text_config": ["model_type": "qwen3_next",
+                            "quantization_config": ["quant_method": "compressed-tensors", "format": "float-quantized"]],
+        ])
+        defer { try? FileManager.default.removeItem(at: dir) }
+        Self.expectRefused(hfSource: "config.json text_config.quantization_config", algorithm: "compressed-tensors") {
+            _ = try Checkpoint(dir: dir)
+        }
+    }
+
+    /// A ModelOpt export declares nothing in `config.json`; the sidecar alone
+    /// is refused, naming the file and its `quant_algo`.
+    @Test func modelOptSidecarIsRefusedAtOpen() throws {
+        let dir = try Self.checkpoint(hfConfig: [:], sidecar: Self.modelOptSidecar)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        Self.expectRefused(hfSource: "hf_quant_config.json", algorithm: "NVFP4") {
+            _ = try Checkpoint(dir: dir)
+        }
+    }
+
+    /// mlx-lm writes `quantization_config` as a copy of its own `quantization`
+    /// block on every quantized convert (`save_config`), so the key beside the
+    /// block means "converted by mlx-lm", not "quantized by someone else". A
+    /// checkpoint carrying the block plus every HF source opens and
+    /// dequantizes to the fixture's exact bytes.
+    @Test func mlxLmBlockBesideHFMetadataIsNotRefused() throws {
+        let dir = try Self.checkpoint(hfConfig: [
+            "quantization_config": ["group_size": 32, "bits": 4],
+            "text_config": ["quantization_config": Self.fp8QuantizationConfig],
+        ], sidecar: Self.modelOptSidecar, keepMLXBlock: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let converted = try Checkpoint(dir: dir)
+        let original = try Checkpoint(dir: Self.fixturesDir.appendingPathComponent("tiny-model-q4"))
+        #expect(converted.defaultQuant?.bits == 4 && converted.defaultQuant?.groupSize == 32)
+        for module in ["model.embed_tokens", "model.layers.0.mlp.gate"] {
+            #expect(try converted.moduleWeight(module).map(\.bitPattern)
+                    == original.moduleWeight(module).map(\.bitPattern),
+                    "\(module): HF metadata beside the mlx-lm block changed the dequantized bytes")
+        }
+    }
+
+    /// The repacker opens the checkpoint first, so it refuses the same way and
+    /// writes no container.
+    @Test func repackRefusesHFQuantizedCheckpointByName() throws {
+        let src = try Self.checkpoint(hfConfig: ["quantization_config": Self.fp8QuantizationConfig])
+        let out = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hfquant-\(UUID().uuidString).qpack")
+        defer {
+            try? FileManager.default.removeItem(at: src)
+            try? FileManager.default.removeItem(at: out)
+        }
+        var repacker = QpackRepacker(checkpointDir: src, outputDir: out)
+        repacker.log = { _ in }
+        Self.expectRefused(hfSource: "config.json quantization_config", algorithm: "fp8") {
+            try repacker.repack()
+        }
+        #expect(!FileManager.default.fileExists(atPath: out.path), "refusal must not leave a partial container")
+    }
+
+    /// The streaming installer decides from `config.json` and the sidecar it
+    /// fetches beside it, before its shard plan and before it writes anything
+    /// into the output directory, so a refused checkpoint costs no weight
+    /// byte. All three sources, each alone.
+    @Test func streamingInstallRefusesHFQuantizedBeforeTheFirstByte() throws {
+        let cases: [(config: [String: Any], sidecar: [String: Any]?, source: String, algorithm: String)] = [
+            (["quantization_config": Self.fp8QuantizationConfig], nil, "config.json quantization_config", "fp8"),
+            (["text_config": ["quantization_config": ["quant_method": "awq", "bits": 4]]], nil,
+             "config.json text_config.quantization_config", "awq"),
+            ([:], Self.modelOptSidecar, "hf_quant_config.json", "NVFP4"),
+        ]
+        for c in cases {
+            let src = try Self.checkpoint(hfConfig: c.config, sidecar: c.sidecar)
+            let out = FileManager.default.temporaryDirectory
+                .appendingPathComponent("hfquant-stream-\(UUID().uuidString).qpack")
+            defer {
+                try? FileManager.default.removeItem(at: src)
+                try? FileManager.default.removeItem(at: out)
+            }
+            let installer = StreamingInstaller(source: .localDirectory(src), outputDir: out)
+            installer.log = { _ in }
+            Self.expectRefused(hfSource: c.source, algorithm: c.algorithm) { try installer.install() }
+            for file in ["config.json", "manifest.json", "packed_experts/layer_00.bin",
+                         "packed_experts/layout.json", "model.safetensors"] {
+                #expect(!FileManager.default.fileExists(atPath: out.appendingPathComponent(file).path),
+                        "\(file) must not be written for a checkpoint refused by \(c.source)")
+            }
+        }
+    }
+
+    /// An mlx-lm convert that still carries HF metadata beside its
+    /// `quantization` block streams as before, and the sidecar is not fetched
+    /// for it.
+    @Test func streamingInstallAcceptsMLXConvertCarryingHFMetadata() throws {
+        let src = try Self.checkpoint(hfConfig: ["quantization_config": ["group_size": 32, "bits": 4]],
+                                      sidecar: Self.modelOptSidecar, keepMLXBlock: true)
+        let out = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hfquant-ok-\(UUID().uuidString).qpack")
+        defer {
+            try? FileManager.default.removeItem(at: src)
+            try? FileManager.default.removeItem(at: out)
+        }
+        let installer = StreamingInstaller(source: .localDirectory(src), outputDir: out)
+        installer.log = { _ in }
+        try installer.install()
+        let manifest = try JSONDecoder().decode(
+            Qpack.Manifest.self, from: Data(contentsOf: out.appendingPathComponent("manifest.json")))
+        #expect(manifest.quantBits == 4 && manifest.quantGroupSize == 32)
+    }
+
+    /// The deciding function alone: mlx-lm's order of the three sources, the
+    /// algorithm each shape names, the sidecar read only when `config.json`
+    /// names nothing, and the mlx-lm block switching the whole check off.
+    @Test func hfQuantizationCheckNamesTheSourceAndAlgorithm() throws {
+        var sidecarReads = 0
+        func sidecar(_ value: [String: Any]?) -> () throws -> [String: Any]? {
+            { sidecarReads += 1; return value }
+        }
+        let embeddedModelOpt: [String: Any] = ["quant_method": "modelopt", "quantization": ["quant_algo": "NVFP4"]]
+
+        // Order: the top level, then text_config, then the sidecar.
+        var found = try Checkpoint.hfQuantization(fromConfig: [
+            "quantization_config": Self.fp8QuantizationConfig,
+            "text_config": ["quantization_config": ["quant_method": "awq"]],
+        ], hfQuantConfig: sidecar(Self.modelOptSidecar))
+        #expect(found?.source == "config.json quantization_config" && found?.algorithm == "fp8")
+        found = try Checkpoint.hfQuantization(fromConfig: ["text_config": ["quantization_config": embeddedModelOpt]],
+                                              hfQuantConfig: sidecar(Self.modelOptSidecar))
+        #expect(found?.source == "config.json text_config.quantization_config" && found?.algorithm == "modelopt/NVFP4")
+        #expect(sidecarReads == 0, "the sidecar is read only when config.json names nothing")
+        found = try Checkpoint.hfQuantization(fromConfig: [:], hfQuantConfig: sidecar(Self.modelOptSidecar))
+        #expect(found?.source == "hf_quant_config.json" && found?.algorithm == "NVFP4")
+        #expect(sidecarReads == 1)
+        #expect(try Checkpoint.hfQuantization(fromConfig: [:], hfQuantConfig: sidecar(nil)) == nil)
+
+        // Algorithm spellings: quant_algo at the top level, neither key, an empty object.
+        #expect(try Checkpoint.hfQuantization(fromConfig: ["quantization_config": ["quant_algo": "FP8"]],
+                                              hfQuantConfig: sidecar(nil))?.algorithm == "FP8")
+        #expect(try Checkpoint.hfQuantization(fromConfig: ["quantization_config": ["bits": 8]],
+                                              hfQuantConfig: sidecar(nil))?.algorithm == "unknown")
+        #expect(try Checkpoint.hfQuantization(fromConfig: ["quantization_config": [String: Any]()],
+                                              hfQuantConfig: sidecar(nil)) == nil,
+                "an empty quantization_config declares nothing, as mlx-lm treats it")
+        // A present but unreadable sidecar still counts; an absent one is nil.
+        #expect(Checkpoint.hfQuantConfig(from: Data("not json".utf8))?.isEmpty == true)
+        #expect(Checkpoint.hfQuantConfig(from: nil) == nil)
+
+        // The mlx-lm block switches the check off whatever else is present, without reading the sidecar.
+        sidecarReads = 0
+        try Checkpoint.checkHFQuantization(config: [
+            "quantization": ["group_size": 32, "bits": 4],
+            "quantization_config": Self.fp8QuantizationConfig,
+        ], hfQuantConfig: sidecar(Self.modelOptSidecar))
+        #expect(sidecarReads == 0)
+        // Without it, the same config is refused by name.
+        Self.expectRefused(hfSource: "config.json quantization_config", algorithm: "fp8") {
+            try Checkpoint.checkHFQuantization(config: ["quantization_config": Self.fp8QuantizationConfig],
+                                               hfQuantConfig: sidecar(nil))
+        }
+    }
 }
